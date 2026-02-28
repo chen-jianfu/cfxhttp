@@ -61,40 +61,49 @@ function isCFError(err) {
 }
 
 // -----------------------------------------------------------------------------
-// 协议头解析器 (VLESS)
+// 协议头解析器 (带自动扩容安全机制的极速版)
 // -----------------------------------------------------------------------------
-const PROTO_VER = 0
-const TYPE_TCP = 1
-const ADDR_V4 = 1
-const ADDR_DNS = 2
-const ADDR_V6 = 3
+const PROTO_VER = 0;
+const TYPE_TCP = 1;
+const ADDR_V4 = 1;
+const ADDR_DNS = 2;
+const ADDR_V6 = 3;
 
-// 真正高效的头部解析器 (零拷贝理念)
 async function resolveHeader(streamReader) {
-    const buffer = new Uint8Array(2048); // 预分配一个足够大的缓冲区
+    // 初始分配 4KB (足够应对 99% 的情况)，避免 XHTTP 大包溢出
+    let buffer = new Uint8Array(4096); 
     let offset = 0;
 
-    // 辅助函数：确保缓冲区里有指定的字节数
+    // 辅助函数：安全读取指定字节，带自动扩容机制
     const requireBytes = async (length) => {
         while (offset < length) {
             const { value, done } = await streamReader.read();
-            if (done) return false; // 流提前结束
+            if (done) return false;
+            
+            // 【核心修复】：如果发现数据块比当前的 buffer 还大，自动扩容！
+            if (offset + value.length > buffer.length) {
+                // 按 2 倍或实际需要的大小扩容
+                const newSize = Math.max(buffer.length * 2, offset + value.length);
+                const newBuffer = new Uint8Array(newSize);
+                newBuffer.set(buffer); // 搬运老数据
+                buffer = newBuffer;    // 替换成大容量的新数组
+            }
+            
             buffer.set(value, offset);
             offset += value.length;
         }
         return true;
     };
 
-    // 1. 读取基础头部 (至少 18 字节: 1(ver) + 16(uuid) + 1(meta_len))
     if (!(await requireBytes(18))) return null;
-    
     if (buffer[0] !== PROTO_VER) return { error: 'Err:V' };
-    if (!checkAuth(buffer, 1)) return { error: 'Err:A' }
+    
+    // UUID 校验 (配合之前的零分配 checkAuth)
+    if (!checkAuth(buffer, 1)) return { error: 'Err:A' };
 
     const metaLen = buffer[17];
-    
-    // 2. 读取完整的 Meta + Action + Port + AddrType
     const addrTypeIdx = 18 + metaLen + 2; 
+    
     if (!(await requireBytes(addrTypeIdx + 1))) return null;
 
     const action = buffer[18 + metaLen];
@@ -108,7 +117,6 @@ async function resolveHeader(streamReader) {
     let targetAddr = '';
     let payloadStart = 0;
 
-    // 3. 根据地址类型读取地址
     if (addrType === ADDR_V4) {
         payloadStart = addrStart + 4;
         if (!(await requireBytes(payloadStart))) return null;
@@ -124,18 +132,16 @@ async function resolveHeader(streamReader) {
     } else if (addrType === ADDR_V6) {
         payloadStart = addrStart + 16;
         if (!(await requireBytes(payloadStart))) return null;
-        // 使用优化后的 IPv6 位运算拼接
         const parts = [];
         for (let i = 0; i < 16; i += 2) {
             parts.push(((buffer[addrStart + i] << 8) | buffer[addrStart + i + 1]).toString(16));
         }
         targetAddr = `[${parts.join(':')}]`;
-        
     } else {
         return { error: `Err:T-${addrType}` };
     }
 
-    // 将多读出来的数据（首帧 Payload）作为 initialData 返回
+    // 将多读出来的数据（首帧 Payload）提取出来
     const initialData = offset > payloadStart ? buffer.slice(payloadStart, offset) : new Uint8Array(0);
     
     return { targetAddr, port, initialData, ver: buffer[0] };
