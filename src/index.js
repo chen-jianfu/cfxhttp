@@ -10,9 +10,40 @@ const CF_FALLBACK_IPS = ['13.230.34.30']
 // -----------------------------------------------------------------------------
 // 数据处理与校验工具
 // -----------------------------------------------------------------------------
-const AUTH_CHUNKS = new Uint8Array(16)
+
+
+// ============================================================================
+// 1. 全局初始化阶段 (只在 Worker 冷启动时运行一次)
+// ============================================================================
+const AUTH_CHUNKS = new Uint8Array(16);
+// 将横杠去掉，提前准备好纯 16 进制字符串
+const cleanHex = AUTH_KEY.replace(/-/g, '');
 for (let i = 0; i < 16; i++) {
-    AUTH_CHUNKS[i] = parseInt(AUTH_KEY.replace(/-/g, '').substr(i * 2, 2), 16)
+    AUTH_CHUNKS[i] = parseInt(cleanHex.substring(i * 2, i * 2 + 2), 16);
+}
+
+// ============================================================================
+// 2. 校验函数 (热点路径：极速零分配校验)
+// 传入整个 buffer 和起始位置 offset，绝对不创建新对象！
+// ============================================================================
+function checkAuth(buffer, offset) {
+    // 使用循环展开(Loop Unrolling)，比 for 循环更快，零内存分配
+    return buffer[offset]      === AUTH_CHUNKS[0]  &&
+           buffer[offset + 1]  === AUTH_CHUNKS[1]  &&
+           buffer[offset + 2]  === AUTH_CHUNKS[2]  &&
+           buffer[offset + 3]  === AUTH_CHUNKS[3]  &&
+           buffer[offset + 4]  === AUTH_CHUNKS[4]  &&
+           buffer[offset + 5]  === AUTH_CHUNKS[5]  &&
+           buffer[offset + 6]  === AUTH_CHUNKS[6]  &&
+           buffer[offset + 7]  === AUTH_CHUNKS[7]  &&
+           buffer[offset + 8]  === AUTH_CHUNKS[8]  &&
+           buffer[offset + 9]  === AUTH_CHUNKS[9]  &&
+           buffer[offset + 10] === AUTH_CHUNKS[10] &&
+           buffer[offset + 11] === AUTH_CHUNKS[11] &&
+           buffer[offset + 12] === AUTH_CHUNKS[12] &&
+           buffer[offset + 13] === AUTH_CHUNKS[13] &&
+           buffer[offset + 14] === AUTH_CHUNKS[14] &&
+           buffer[offset + 15] === AUTH_CHUNKS[15];
 }
 
 function mergeBuffer(a, b) {
@@ -21,14 +52,6 @@ function mergeBuffer(a, b) {
     c.set(b, a.length)
     return c
 }
-
-function checkAuth(id) {
-    for (let i = 0; i < 16; i++) {
-        if (id[i] !== AUTH_CHUNKS[i]) return false
-    }
-    return true
-}
-
 
 function isCFError(err) {
     const msg = err?.message?.toLowerCase() || '';
@@ -66,7 +89,7 @@ async function resolveHeader(streamReader) {
     if (!(await requireBytes(18))) return null;
     
     if (buffer[0] !== PROTO_VER) return { error: 'Err:V' };
-    if (!checkAuth(buffer.subarray(1, 17))) return { error: 'Err:A' };
+    if (!checkAuth(buffer, 1)) return { error: 'Err:A' }
 
     const metaLen = buffer[17];
     
