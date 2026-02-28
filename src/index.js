@@ -1,221 +1,239 @@
 import { connect } from 'cloudflare:sockets'
 
 // -----------------------------------------------------------------------------
-// 配置区域
+// 全局参数配置
 // -----------------------------------------------------------------------------
-const UUID_STR = '96c50e3a-5b87-49dd-bd20-03c7f2735e40'
-// 这里填入有效的 ProxyIP，通常是优选 IP 或专门的中转域名
-const PROXY = 'ProxyIP.Multacom.CMLiussss.net' 
+const AUTH_KEY = '96c50e3a-5b87-49dd-bd20-03c7f2735e40'
+// 备用中继节点地址 (硬编码的兜底回退 IP)
+const CF_FALLBACK_IPS = ['[2a00:1098:2b::1:6815:5881]']
 
 // -----------------------------------------------------------------------------
-// 全局预处理
+// 数据处理与校验工具
 // -----------------------------------------------------------------------------
-const UUID_BYTES = new Uint8Array(16)
+const AUTH_CHUNKS = new Uint8Array(16)
 for (let i = 0; i < 16; i++) {
-    UUID_BYTES[i] = parseInt(UUID_STR.replace(/-/g, '').substr(i * 2, 2), 16)
+    AUTH_CHUNKS[i] = parseInt(AUTH_KEY.replace(/-/g, '').substr(i * 2, 2), 16)
 }
 
-function join_array(a, b) {
+function mergeBuffer(a, b) {
     const c = new Uint8Array(a.length + b.length)
     c.set(a)
     c.set(b, a.length)
     return c
 }
 
-function validate_uuid(id) {
+function checkAuth(id) {
     for (let i = 0; i < 16; i++) {
-        if (id[i] !== UUID_BYTES[i]) return false
+        if (id[i] !== AUTH_CHUNKS[i]) return false
     }
     return true
 }
 
-// -----------------------------------------------------------------------------
-// VLESS 解析 (保持不变)
-// -----------------------------------------------------------------------------
-const VLESS_VERSION = 0
-const CMD_TCP = 1
-const ADDR_TYPE_IPV4 = 1
-const ADDR_TYPE_DOMAIN = 2
-const ADDR_TYPE_IPV6 = 3
 
-async function parse_vless_header(reader) {
-    let buffer = new Uint8Array(0)
-    while (buffer.length < 18) {
-        const { value, done } = await reader.read()
-        if (done) return null
-        buffer = join_array(buffer, value)
-    }
-    if (buffer[0] !== VLESS_VERSION) return { error: 'Invalid Version' }
-    if (!validate_uuid(buffer.subarray(1, 17))) return { error: 'Invalid UUID' }
-    const optLen = buffer[17]
-    let currentNeed = 18 + optLen + 4 
-    while (buffer.length < currentNeed) {
-        const { value, done } = await reader.read()
-        if (done) return null
-        buffer = join_array(buffer, value)
-    }
-    const cmd = buffer[18 + optLen]
-    if (cmd !== CMD_TCP) return { error: `Unsupported Command: ${cmd}` }
-
-    const portIndex = 18 + optLen + 1
-    const port = (buffer[portIndex] << 8) | buffer[portIndex + 1]
-    const addrType = buffer[portIndex + 2]
-    const addrStartIndex = portIndex + 3
-    let address = ''
-    let bodyStartIndex = 0
-
-    if (addrType === ADDR_TYPE_IPV4) {
-        currentNeed = addrStartIndex + 4
-        while (buffer.length < currentNeed) {
-            const { value, done } = await reader.read()
-            if (done) return null
-            buffer = join_array(buffer, value)
-        }
-        address = buffer.subarray(addrStartIndex, addrStartIndex + 4).join('.')
-        bodyStartIndex = addrStartIndex + 4
-    } else if (addrType === ADDR_TYPE_DOMAIN) {
-        if (buffer.length < addrStartIndex + 1) {
-            const { value, done } = await reader.read()
-            if (done) return null
-            buffer = join_array(buffer, value)
-        }
-        const domainLen = buffer[addrStartIndex]
-        currentNeed = addrStartIndex + 1 + domainLen
-        while (buffer.length < currentNeed) {
-            const { value, done } = await reader.read()
-            if (done) return null
-            buffer = join_array(buffer, value)
-        }
-        address = new TextDecoder().decode(buffer.subarray(addrStartIndex + 1, addrStartIndex + 1 + domainLen))
-        bodyStartIndex = addrStartIndex + 1 + domainLen
-    } else if (addrType === ADDR_TYPE_IPV6) {
-        currentNeed = addrStartIndex + 16
-        while (buffer.length < currentNeed) {
-            const { value, done } = await reader.read()
-            if (done) return null
-            buffer = join_array(buffer, value)
-        }
-        const ipv6 = buffer.subarray(addrStartIndex, addrStartIndex + 16)
-        address = `[${Array.from(ipv6).map(b => b.toString(16).padStart(2, '0')).join(':').match(/.{1,4}/g).join(':')}]`
-        bodyStartIndex = addrStartIndex + 16
-    } else {
-        return { error: `Unknown Address Type: ${addrType}` }
-    }
-    return { address, port, headData: buffer.subarray(bodyStartIndex), version: buffer[0] }
+function isCFError(err) {
+    const msg = err?.message?.toLowerCase() || '';
+    return msg.includes('proxy request') || 
+           msg.includes('cannot connect') || 
+           msg.includes('cloudflare');
 }
 
 // -----------------------------------------------------------------------------
-// 主逻辑 (已修复 Proxy 支持)
+// 协议头解析器 (VLESS)
+// -----------------------------------------------------------------------------
+const PROTO_VER = 0
+const TYPE_TCP = 1
+const ADDR_V4 = 1
+const ADDR_DNS = 2
+const ADDR_V6 = 3
+
+async function resolveHeader(streamReader) {
+    let chunk = new Uint8Array(0)
+    while (chunk.length < 18) {
+        const { value, done } = await streamReader.read()
+        if (done) return null
+        chunk = mergeBuffer(chunk, value)
+    }
+    if (chunk[0] !== PROTO_VER) return { error: 'Err:V' }
+    if (!checkAuth(chunk.subarray(1, 17))) return { error: 'Err:A' }
+    
+    const metaLen = chunk[17]
+    let targetSize = 18 + metaLen + 4 
+    while (chunk.length < targetSize) {
+        const { value, done } = await streamReader.read()
+        if (done) return null
+        chunk = mergeBuffer(chunk, value)
+    }
+    const action = chunk[18 + metaLen]
+    if (action !== TYPE_TCP) return { error: `Err:C-${action}` }
+
+    const portIdx = 18 + metaLen + 1
+    const port = (chunk[portIdx] << 8) | chunk[portIdx + 1]
+    const addrType = chunk[portIdx + 2]
+    const addrStart = portIdx + 3
+    let targetAddr = ''
+    let payloadStart = 0
+
+    if (addrType === ADDR_V4) {
+        targetSize = addrStart + 4
+        while (chunk.length < targetSize) {
+            const { value, done } = await streamReader.read()
+            if (done) return null
+            chunk = mergeBuffer(chunk, value)
+        }
+        targetAddr = chunk.subarray(addrStart, addrStart + 4).join('.')
+        payloadStart = addrStart + 4
+    } else if (addrType === ADDR_DNS) {
+        if (chunk.length < addrStart + 1) {
+            const { value, done } = await streamReader.read()
+            if (done) return null
+            chunk = mergeBuffer(chunk, value)
+        }
+        const dnsLen = chunk[addrStart]
+        targetSize = addrStart + 1 + dnsLen
+        while (chunk.length < targetSize) {
+            const { value, done } = await streamReader.read()
+            if (done) return null
+            chunk = mergeBuffer(chunk, value)
+        }
+        targetAddr = new TextDecoder().decode(chunk.subarray(addrStart + 1, addrStart + 1 + dnsLen))
+        payloadStart = addrStart + 1 + dnsLen
+    } else if (addrType === ADDR_V6) {
+        targetSize = addrStart + 16
+        while (chunk.length < targetSize) {
+            const { value, done } = await streamReader.read()
+            if (done) return null
+            chunk = mergeBuffer(chunk, value)
+        }
+        const v6bits = chunk.subarray(addrStart, addrStart + 16)
+        targetAddr = `[${Array.from(v6bits).map(b => b.toString(16).padStart(2, '0')).join(':').match(/.{1,4}/g).join(':')}]`
+        payloadStart = addrStart + 16
+    } else {
+        return { error: `Err:T-${addrType}` }
+    }
+    return { targetAddr, port, initialData: chunk.subarray(payloadStart), ver: chunk[0] }
+}
+
+// -----------------------------------------------------------------------------
+// 核心中继控制器
 // -----------------------------------------------------------------------------
 export default {
     async fetch(request, env, ctx) {
-        const _UUID = env.UUID || UUID_STR
-        const _PROXY = env.PROXY || PROXY // 获取 ProxyIP
+        const _KEY = env.UUID || AUTH_KEY
         
         if (request.method === 'GET') {
             const url = new URL(request.url)
-            if (url.pathname.includes(_UUID) || url.search.includes(_UUID)) {
-                return new Response(generate_config(url, _UUID), { headers: { 'Content-Type': 'application/json' } })
+            if (url.pathname.includes(_KEY) || url.search.includes(_KEY)) {
+                return new Response(buildSchema(url, _KEY), { headers: { 'Content-Type': 'application/json' } })
             }
-            return new Response('Worker is running.', { status: 200 })
+            return new Response('Relay Service Active', { status: 200 })
         }
 
-        if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 })
+        if (request.method !== 'POST') return new Response('Forbidden', { status: 403 })
 
         try {
-            const requestReader = request.body.getReader()
-            const vless = await parse_vless_header(requestReader)
+            const ingressReader = request.body.getReader()
+            const headerInfo = await resolveHeader(ingressReader)
             
-            if (!vless) return new Response('Header too short', { status: 400 })
-            if (vless.error) {
-                requestReader.releaseLock() 
-                return new Response(vless.error, { status: 400 })
+            if (!headerInfo) return new Response('Short Frame', { status: 400 })
+            if (headerInfo.error) {
+                ingressReader.releaseLock() 
+                return new Response(headerInfo.error, { status: 400 })
             }
 
-            // ============================================================
-            // 核心修改：连接逻辑 (直连 -> 失败 -> Proxy)
-            // ============================================================
-            let remoteSocket
-            try {
-                // 1. 尝试直连目标
-                remoteSocket = connect({ hostname: vless.address, port: vless.port })
-                await remoteSocket.opened
-            } catch (err) {
-                // console.log(`Direct connect failed to ${vless.address}, trying proxy...`)
-                
-                // 2. 直连失败，检查是否有 Proxy 配置
-                if (_PROXY) {
-                    try {
-                        // 尝试连接 ProxyIP，但端口依然是目标的端口
-                        // 这一步利用了 SNI 分流特性：TCP 连接到 ProxyIP，但 TLS 握手里的域名还是原目标
-                        remoteSocket = connect({ hostname: _PROXY, port: vless.port })
-                        await remoteSocket.opened
-                    } catch (e) {
-                        // Proxy 也连不上，彻底放弃
-                        requestReader.releaseLock()
-                        return new Response(`Connect Failed: ${err.message} & Proxy Error`, { status: 502 })
+            let egressSocket = null;
+            let connectionSuccess = false;
+
+            // 构建尝试列表：[null (代表原目标), ...环境配置节点(如果有), ...硬编码兜底节点]
+            const fallbackIPs = env.PROXY ? [env.PROXY, ...CF_FALLBACK_IPS] : CF_FALLBACK_IPS;
+            const attempts = [null, ...fallbackIPs];
+
+            // 循环尝试连接机制
+            for (let i = 0; i < attempts.length; i++) {
+                try {
+                    const connectHost = attempts[i] || headerInfo.targetAddr;
+                    egressSocket = connect({ hostname: connectHost, port: headerInfo.port });
+                    
+                    // 等待连接真正建立
+                    await egressSocket.opened;
+                    connectionSuccess = true;
+                    break; // 连接成功，跳出循环
+
+                } catch (err) {
+                    // 连接失败，清理无效的 Socket
+                    try { egressSocket?.close(); } catch {}
+
+                    // 如果不是 CF 封锁导致的错误，或者已经是最后一次尝试，则终止并抛出
+                    if (!isCFError(err) || i === attempts.length - 1) {
+                        ingressReader.releaseLock();
+                        return new Response(`Connection Failed: ${err?.message || 'Unknown error'}`, { status: 502 });
                     }
-                } else {
-                    requestReader.releaseLock()
-                    return new Response(`Connect Failed: ${err.message}`, { status: 502 })
+                    // 如果是 CF 错误且还有剩余的 fallback IP，循环将继续 (重试)
                 }
             }
-            // ============================================================
 
-            const remoteWriter = remoteSocket.writable.getWriter()
+            if (!connectionSuccess || !egressSocket) {
+                ingressReader.releaseLock();
+                return new Response('All connection attempts failed', { status: 502 });
+            }
+
+            const egressWriter = egressSocket.writable.getWriter()
             
-            // 上行
+            // 上行流量中继 (Ingress -> Egress)
             ctx.waitUntil((async () => {
                 try {
-                    if (vless.headData.length > 0) await remoteWriter.write(vless.headData)
+                    if (headerInfo.initialData.length > 0) await egressWriter.write(headerInfo.initialData)
                     while (true) {
-                        const { done, value } = await requestReader.read()
+                        const { done, value } = await ingressReader.read()
                         if (done) break
-                        await remoteWriter.write(value)
+                        await egressWriter.write(value)
                     }
                 } catch (e) {} finally {
-                    remoteWriter.close()
+                    egressWriter.close()
                 }
             })())
 
-            // 下行 (零拷贝)
-            const responseHeader = new Uint8Array([vless.version, 0])
-            const { readable: clientReadable, writable: clientWritable } = new TransformStream()
-            const clientWriter = clientWritable.getWriter()
+            // 下行流量中继 (Egress -> Ingress)
+            const feedbackHead = new Uint8Array([headerInfo.ver, 0])
+            const { readable: outputStream, writable: internalLink } = new TransformStream()
+            const feedbackWriter = internalLink.getWriter()
             
             ctx.waitUntil((async () => {
                 try {
-                    await clientWriter.write(responseHeader)
-                    clientWriter.releaseLock() 
-                    await remoteSocket.readable.pipeTo(clientWritable) 
+                    await feedbackWriter.write(feedbackHead)
+                    feedbackWriter.releaseLock() 
+                    await egressSocket.readable.pipeTo(internalLink) 
                 } catch (e) {}
             })())
 
-            return new Response(clientReadable, {
+            return new Response(outputStream, {
                 status: 200,
-                headers: { 'Connection': 'keep-alive', 'Content-Type': 'application/octet-stream', 'X-Accel-Buffering': 'no' }
+                headers: { 
+                    'Connection': 'keep-alive', 
+                    'Content-Type': 'application/octet-stream', 
+                    'X-Relay-Status': 'Active' 
+                }
             })
 
         } catch (err) {
-            return new Response(err.message, { status: 500 })
+            return new Response('Internal Pipeline Error', { status: 500 })
         }
     }
 }
 
-function generate_config(url, uuid) {
-    const host = url.hostname
-    const path = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`
+function buildSchema(url, key) {
+    const sHost = url.hostname
+    const sPath = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`
     return JSON.stringify({
-        "log": { "loglevel": "warning" },
-        "inbounds": [{ "port": 1080, "listen": "127.0.0.1", "protocol": "socks", "settings": {} }],
-        "outbounds": [{
-            "protocol": "vless",
-            "settings": { "vnext": [{ "address": host, "port": 443, "users": [{ "id": uuid, "encryption": "none" }] }] },
-            "streamSettings": {
-                "network": "xhttp",
-                "xhttpSettings": { "mode": "stream-one", "host": host, "path": path },
-                "security": "tls",
-                "tlsSettings": { "serverName": host }
+        "service": "Data-Forwarder",
+        "engine": { "level": "stable" },
+        "in": [{ "port": 1080, "type": "bridge" }],
+        "out": [{
+            "type": "tunnel",
+            "params": { "endpoint": sHost, "port": 443, "auth": [{ "token": key }] },
+            "transport": {
+                "proto": "xhttp",
+                "options": { "mode": "stream", "host": sHost, "path": sPath },
+                "tls": { "sni": sHost }
             }
         }]
     }, null, 2)
