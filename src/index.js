@@ -5,7 +5,7 @@ import { connect } from 'cloudflare:sockets'
 // -----------------------------------------------------------------------------
 const AUTH_KEY = '96c50e3a-5b87-49dd-bd20-03c7f2735e40'
 // 备用中继节点地址 (硬编码的兜底回退 IP)
-const CF_FALLBACK_IPS = ['[2a00:1098:2b::1:6815:5881]']
+const CF_FALLBACK_IPS = ['13.230.34.30']
 
 // -----------------------------------------------------------------------------
 // 数据处理与校验工具
@@ -46,71 +46,76 @@ const ADDR_V4 = 1
 const ADDR_DNS = 2
 const ADDR_V6 = 3
 
+// 真正高效的头部解析器 (零拷贝理念)
 async function resolveHeader(streamReader) {
-    let chunk = new Uint8Array(0)
-    while (chunk.length < 18) {
-        const { value, done } = await streamReader.read()
-        if (done) return null
-        chunk = mergeBuffer(chunk, value)
-    }
-    if (chunk[0] !== PROTO_VER) return { error: 'Err:V' }
-    if (!checkAuth(chunk.subarray(1, 17))) return { error: 'Err:A' }
+    const buffer = new Uint8Array(2048); // 预分配一个足够大的缓冲区
+    let offset = 0;
+
+    // 辅助函数：确保缓冲区里有指定的字节数
+    const requireBytes = async (length) => {
+        while (offset < length) {
+            const { value, done } = await streamReader.read();
+            if (done) return false; // 流提前结束
+            buffer.set(value, offset);
+            offset += value.length;
+        }
+        return true;
+    };
+
+    // 1. 读取基础头部 (至少 18 字节: 1(ver) + 16(uuid) + 1(meta_len))
+    if (!(await requireBytes(18))) return null;
     
-    const metaLen = chunk[17]
-    let targetSize = 18 + metaLen + 4 
-    while (chunk.length < targetSize) {
-        const { value, done } = await streamReader.read()
-        if (done) return null
-        chunk = mergeBuffer(chunk, value)
-    }
-    const action = chunk[18 + metaLen]
-    if (action !== TYPE_TCP) return { error: `Err:C-${action}` }
+    if (buffer[0] !== PROTO_VER) return { error: 'Err:V' };
+    if (!checkAuth(buffer.subarray(1, 17))) return { error: 'Err:A' };
 
-    const portIdx = 18 + metaLen + 1
-    const port = (chunk[portIdx] << 8) | chunk[portIdx + 1]
-    const addrType = chunk[portIdx + 2]
-    const addrStart = portIdx + 3
-    let targetAddr = ''
-    let payloadStart = 0
+    const metaLen = buffer[17];
+    
+    // 2. 读取完整的 Meta + Action + Port + AddrType
+    const addrTypeIdx = 18 + metaLen + 2; 
+    if (!(await requireBytes(addrTypeIdx + 1))) return null;
 
+    const action = buffer[18 + metaLen];
+    if (action !== TYPE_TCP) return { error: `Err:C-${action}` };
+
+    const portIdx = 18 + metaLen + 1;
+    const port = (buffer[portIdx] << 8) | buffer[portIdx + 1];
+    const addrType = buffer[portIdx + 2];
+    const addrStart = portIdx + 3;
+
+    let targetAddr = '';
+    let payloadStart = 0;
+
+    // 3. 根据地址类型读取地址
     if (addrType === ADDR_V4) {
-        targetSize = addrStart + 4
-        while (chunk.length < targetSize) {
-            const { value, done } = await streamReader.read()
-            if (done) return null
-            chunk = mergeBuffer(chunk, value)
-        }
-        targetAddr = chunk.subarray(addrStart, addrStart + 4).join('.')
-        payloadStart = addrStart + 4
+        payloadStart = addrStart + 4;
+        if (!(await requireBytes(payloadStart))) return null;
+        targetAddr = `${buffer[addrStart]}.${buffer[addrStart+1]}.${buffer[addrStart+2]}.${buffer[addrStart+3]}`;
+        
     } else if (addrType === ADDR_DNS) {
-        if (chunk.length < addrStart + 1) {
-            const { value, done } = await streamReader.read()
-            if (done) return null
-            chunk = mergeBuffer(chunk, value)
-        }
-        const dnsLen = chunk[addrStart]
-        targetSize = addrStart + 1 + dnsLen
-        while (chunk.length < targetSize) {
-            const { value, done } = await streamReader.read()
-            if (done) return null
-            chunk = mergeBuffer(chunk, value)
-        }
-        targetAddr = new TextDecoder().decode(chunk.subarray(addrStart + 1, addrStart + 1 + dnsLen))
-        payloadStart = addrStart + 1 + dnsLen
+        if (!(await requireBytes(addrStart + 1))) return null;
+        const dnsLen = buffer[addrStart];
+        payloadStart = addrStart + 1 + dnsLen;
+        if (!(await requireBytes(payloadStart))) return null;
+        targetAddr = new TextDecoder().decode(buffer.subarray(addrStart + 1, payloadStart));
+        
     } else if (addrType === ADDR_V6) {
-        targetSize = addrStart + 16
-        while (chunk.length < targetSize) {
-            const { value, done } = await streamReader.read()
-            if (done) return null
-            chunk = mergeBuffer(chunk, value)
+        payloadStart = addrStart + 16;
+        if (!(await requireBytes(payloadStart))) return null;
+        // 使用优化后的 IPv6 位运算拼接
+        const parts = [];
+        for (let i = 0; i < 16; i += 2) {
+            parts.push(((buffer[addrStart + i] << 8) | buffer[addrStart + i + 1]).toString(16));
         }
-        const v6bits = chunk.subarray(addrStart, addrStart + 16)
-        targetAddr = `[${Array.from(v6bits).map(b => b.toString(16).padStart(2, '0')).join(':').match(/.{1,4}/g).join(':')}]`
-        payloadStart = addrStart + 16
+        targetAddr = `[${parts.join(':')}]`;
+        
     } else {
-        return { error: `Err:T-${addrType}` }
+        return { error: `Err:T-${addrType}` };
     }
-    return { targetAddr, port, initialData: chunk.subarray(payloadStart), ver: chunk[0] }
+
+    // 将多读出来的数据（首帧 Payload）作为 initialData 返回
+    const initialData = offset > payloadStart ? buffer.slice(payloadStart, offset) : new Uint8Array(0);
+    
+    return { targetAddr, port, initialData, ver: buffer[0] };
 }
 
 // -----------------------------------------------------------------------------
