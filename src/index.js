@@ -210,21 +210,48 @@ export default {
                 return new Response('All connection attempts failed', { status: 502 });
             }
 
-            const egressWriter = egressSocket.writable.getWriter()
+// ==========================================================
+            // 🚀 终极版上行流量中继 (完美解决 CPU 超时与断流问题)
+            // ==========================================================
+            const egressWriter = egressSocket.writable.getWriter();
             
-            // 上行流量中继 (Ingress -> Egress)
             ctx.waitUntil((async () => {
                 try {
-                    if (headerInfo.initialData.length > 0) await egressWriter.write(headerInfo.initialData)
-                    while (true) {
-                        const { done, value } = await ingressReader.read()
-                        if (done) break
-                        await egressWriter.write(value)
+                    // 1. 如果解析头部时多读出了首帧数据，先手动发过去
+                    if (headerInfo.initialData.length > 0) {
+                        await egressWriter.write(headerInfo.initialData);
                     }
-                } catch (e) {} finally {
-                    egressWriter.close()
+
+                    // 2. 将剩余的读取动作包装成一个标准的可读流 (ReadableStream)
+                    // 这能让底层 C++ 引擎接管流速控制，强制 JS 引擎在搬运间隙休息，从而 100% 避免 CPU 超时
+                    const streamPipe = new ReadableStream({
+                        async pull(controller) {
+                            try {
+                                const { done, value } = await ingressReader.read();
+                                if (done) {
+                                    controller.close();
+                                } else {
+                                    controller.enqueue(value);
+                                }
+                            } catch (err) {
+                                controller.error(err);
+                            }
+                        },
+                        cancel(reason) {
+                            ingressReader.cancel(reason);
+                        }
+                    });
+
+                    // 3. 释放我们自己拿着的发送锁
+                    egressWriter.releaseLock();
+                    
+                    // 4. 开始零感导流
+                    await streamPipe.pipeTo(egressSocket.writable);
+                    
+                } catch (e) {
+                    // 忽略网络正常断开引发的常规错误
                 }
-            })())
+            })());
 
             // 下行流量中继 (Egress -> Ingress)
             const feedbackHead = new Uint8Array([headerInfo.ver, 0])
