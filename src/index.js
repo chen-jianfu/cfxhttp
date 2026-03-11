@@ -7,6 +7,9 @@ const AUTH_KEY = '96c50e3a-5b87-49dd-bd20-03c7f2735e40'
 // 备用中继节点地址 (硬编码的兜底回退 IP)
 const CF_FALLBACK_IPS = ['13.230.34.30']
 
+
+// ✅ 新增：全局复用 TextDecoder（避免重复创建）
+const TEXT_DECODER = new TextDecoder();
 // -----------------------------------------------------------------------------
 // 数据处理与校验工具
 // -----------------------------------------------------------------------------
@@ -127,8 +130,7 @@ async function resolveHeader(streamReader) {
         const dnsLen = buffer[addrStart];
         payloadStart = addrStart + 1 + dnsLen;
         if (!(await requireBytes(payloadStart))) return null;
-        targetAddr = new TextDecoder().decode(buffer.subarray(addrStart + 1, payloadStart));
-        
+        targetAddr = TEXT_DECODER.decode(buffer.subarray(addrStart + 1, payloadStart));
     } else if (addrType === ADDR_V6) {
         payloadStart = addrStart + 16;
         if (!(await requireBytes(payloadStart))) return null;
@@ -209,71 +211,70 @@ export default {
                 ingressReader.releaseLock();
                 return new Response('All connection attempts failed', { status: 502 });
             }
-
-// ==========================================================
-            // 🚀 终极版上行流量中继 (完美解决 CPU 超时与断流问题)
+           
+ // ==========================================================
+            // 🟢 上行流量：背压感知异步泵 (防丢尾数据版)
             // ==========================================================
-            const egressWriter = egressSocket.writable.getWriter();
+// ==========================================================
+// 🟢 上行流量：使用 pipeTo（自动背压 + 资源管理）
+// ==========================================================
+ctx.waitUntil((async () => {
+    try {
+        // 创建组合流：initialData + 剩余请求数据
+        const combinedStream = new ReadableStream({
+            async start(controller) {
+                // 先注入 initialData
+                if (headerInfo.initialData.length > 0) {
+                    controller.enqueue(headerInfo.initialData);
+                }
+            },
+            async pull(controller) {
+                const { done, value } = await ingressReader.read();
+                if (done) {
+                    controller.close();
+                } else {
+                    controller.enqueue(value);
+                }
+            },
+            cancel(reason) {
+                ingressReader.cancel(reason);
+            }
+        });
+
+        // 一行搞定：自动背压 + 自动关闭
+        await combinedStream.pipeTo(egressSocket.writable);
+
+    } catch (e) {
+        // 忽略正常断开
+    } finally {
+        try { egressSocket.close(); } catch {}
+    }
+})());
+
+
+            // ==========================================================
+            // 🔵 下行流量：原生零拷贝通道
+            // ==========================================================
+            const feedbackHead = new Uint8Array([headerInfo.ver, 0]);
+            const { readable: outputStream, writable: internalLink } = new TransformStream();
             
             ctx.waitUntil((async () => {
                 try {
-                    // 1. 如果解析头部时多读出了首帧数据，先手动发过去
-                    if (headerInfo.initialData.length > 0) {
-                        await egressWriter.write(headerInfo.initialData);
-                    }
-
-                    // 2. 将剩余的读取动作包装成一个标准的可读流 (ReadableStream)
-                    // 这能让底层 C++ 引擎接管流速控制，强制 JS 引擎在搬运间隙休息，从而 100% 避免 CPU 超时
-                    const streamPipe = new ReadableStream({
-                        async pull(controller) {
-                            try {
-                                const { done, value } = await ingressReader.read();
-                                if (done) {
-                                    controller.close();
-                                } else {
-                                    controller.enqueue(value);
-                                }
-                            } catch (err) {
-                                controller.error(err);
-                            }
-                        },
-                        cancel(reason) {
-                            ingressReader.cancel(reason);
-                        }
-                    });
-
-                    // 3. 释放我们自己拿着的发送锁
-                    egressWriter.releaseLock();
-                    
-                    // 4. 开始零感导流
-                    await streamPipe.pipeTo(egressSocket.writable);
-                    
+                    const feedbackWriter = internalLink.getWriter();
+                    await feedbackWriter.write(feedbackHead);
+                    feedbackWriter.releaseLock(); 
+                    // 保持原生 pipeTo，极致下载速度，防断流
+                    await egressSocket.readable.pipeTo(internalLink, { preventAbort: true }); 
                 } catch (e) {
-                    // 忽略网络正常断开引发的常规错误
                 }
             })());
 
-            // 下行流量中继 (Egress -> Ingress)
-            const feedbackHead = new Uint8Array([headerInfo.ver, 0])
-            const { readable: outputStream, writable: internalLink } = new TransformStream()
-            const feedbackWriter = internalLink.getWriter()
-            
-            ctx.waitUntil((async () => {
-                try {
-                    await feedbackWriter.write(feedbackHead)
-                    feedbackWriter.releaseLock() 
-                    await egressSocket.readable.pipeTo(internalLink) 
-                } catch (e) {}
-            })())
-
-            return new Response(outputStream, {
-                status: 200,
-                headers: { 
-                    'Connection': 'keep-alive', 
-                    'Content-Type': 'application/octet-stream', 
-                    'X-Relay-Status': 'Active' 
-                }
-            })
+return new Response(outputStream, {
+    status: 200,
+    headers: { 
+        'Content-Type': 'application/octet-stream'
+    }
+});
 
         } catch (err) {
             return new Response('Internal Pipeline Error', { status: 500 })
