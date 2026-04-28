@@ -1,0 +1,448 @@
+import { connect } from 'cloudflare:sockets'
+
+const UUID = '5dc15e15-f285-4a9d-959b-0e4fbdd77b63' //
+const PROXY = 'ProxyIP.US.CMLiussss.net' //
+
+const CAMO_HOST = 'example.com'
+
+const MAX_CONCURRENT = 64
+let ACTIVE_CONNECTIONS = 0
+
+const BUFFER_SIZE = 64 * 1024
+
+function validate_uuid(id, uuid) {
+    for (let index = 0; index < 16; index++) {
+        const v = id[index]
+        const u = uuid[index]
+        if (v !== u) {
+            return false
+        }
+    }
+    return true
+}
+
+class Counter {
+    #total
+
+    constructor() {
+        this.#total = 0
+    }
+
+    get() {
+        return this.#total
+    }
+
+    add(size) {
+        this.#total += size
+    }
+}
+
+function concat_typed_arrays(first, ...args) {
+    let len = first.length
+    for (let a of args) {
+        len += a.length
+    }
+    const r = new first.constructor(len)
+    r.set(first, 0)
+    len = first.length
+    for (let a of args) {
+        r.set(a, len)
+        len += a.length
+    }
+    return r
+}
+
+function parse_uuid(uuid) {
+    uuid = uuid.replaceAll('-', '')
+    const r = []
+    for (let index = 0; index < 16; index++) {
+        const v = parseInt(uuid.substr(index * 2, 2), 16)
+        r.push(v)
+    }
+    return r
+}
+
+function get_buffer(size) {
+    return new Uint8Array(new ArrayBuffer(size || BUFFER_SIZE))
+}
+
+// enums
+const ADDRESS_TYPE_IPV4 = 1
+const ADDRESS_TYPE_URL = 2
+const ADDRESS_TYPE_IPV6 = 3
+
+async function read_vless_header(readable, uuid_str) {
+    const reader = readable.getReader({ mode: 'byob' })
+
+    let r = await reader.readAtLeast(1 + 16 + 1, get_buffer())
+    let rlen = 0
+    let idx = 0
+    let cache = r.value
+    rlen += r.value.length
+
+    const version = cache[0]
+    const id = cache.slice(1, 1 + 16)
+    const uuid = parse_uuid(uuid_str)
+    if (!validate_uuid(id, uuid)) {
+        return `invalid UUID`
+    }
+    const pb_len = cache[1 + 16]
+    const addr_plus1 = 1 + 16 + 1 + pb_len + 1 + 2 + 1
+
+    if (addr_plus1 + 1 > rlen) {
+        if (r.done) {
+            return `header too short`
+        }
+        idx = addr_plus1 + 1 - rlen
+        r = await reader.readAtLeast(idx, get_buffer())
+        rlen += r.value.length
+        cache = concat_typed_arrays(cache, r.value)
+    }
+
+    const cmd = cache[1 + 16 + 1 + pb_len]
+    if (cmd !== 1) {
+        return `unsupported command: ${cmd}`
+    }
+    const port = (cache[addr_plus1 - 1 - 2] << 8) + cache[addr_plus1 - 1 - 1]
+    const atype = cache[addr_plus1 - 1]
+    let header_len = -1
+    if (atype === ADDRESS_TYPE_IPV4) {
+        header_len = addr_plus1 + 4
+    } else if (atype === ADDRESS_TYPE_IPV6) {
+        header_len = addr_plus1 + 16
+    } else if (atype === ADDRESS_TYPE_URL) {
+        header_len = addr_plus1 + 1 + cache[addr_plus1]
+    }
+
+    if (header_len < 0) {
+        return 'read address type failed'
+    }
+
+    idx = header_len - rlen
+    if (idx > 0) {
+        if (r.done) {
+            return `read address failed`
+        }
+        r = await reader.readAtLeast(idx, get_buffer())
+        rlen += r.value.length
+        cache = concat_typed_arrays(cache, r.value)
+    }
+
+    let hostname = ''
+    idx = addr_plus1
+    switch (atype) {
+        case ADDRESS_TYPE_IPV4:
+            hostname = cache.slice(idx, idx + 4).join('.')
+            break
+        case ADDRESS_TYPE_URL:
+            hostname = new TextDecoder().decode(
+                cache.slice(idx + 1, idx + 1 + cache[idx]),
+            )
+            break
+        case ADDRESS_TYPE_IPV6:
+            hostname = cache
+                .slice(idx, idx + 16)
+                .reduce(
+                    (s, b2, i2, a) =>
+                        i2 % 2
+                            ? s.concat(((a[i2 - 1] << 8) + b2).toString(16))
+                            : s,
+                    [],
+                )
+                .join(':')
+            break
+    }
+
+    if (hostname.length < 1) {
+        return 'failed to parse hostname'
+    }
+
+    const data = cache.slice(header_len)
+    return {
+        hostname,
+        port,
+        data,
+        resp: new Uint8Array([version, 0]),
+        reader,
+        done: r.done,
+    }
+}
+
+async function upload_to_remote(counter, writer, vless) {
+    async function inner_upload(d) {
+        if (d && d.length > 0) {
+            counter.add(d.length)
+            await writer.write(d)
+        }
+    }
+
+    try {
+        await inner_upload(vless.data)
+        while (!vless.done) {
+            const r = await vless.reader.read(get_buffer())
+            if (r.done) break
+            await inner_upload(r.value)
+            vless.done = r.done
+        }
+    } catch (err) {
+        throw err
+    } finally {
+        try {
+            await writer.close()
+        } catch (_) {
+        }
+    }
+}
+
+function create_uploader(vless, writable) {
+    const counter = new Counter()
+    const done = new Promise((resolve, reject) => {
+        const writer = writable.getWriter()
+        upload_to_remote(counter, writer, vless)
+            .then(resolve)
+            .catch(reject)
+            .finally(() => {
+                writer
+                    .close()
+                    .catch(() => {
+                    })
+            })
+    })
+
+    return {
+        counter,
+        done,
+    }
+}
+
+function create_downloader(resp, remote_readable) {
+    const counter = new Counter()
+    let stream
+
+    const done = new Promise((resolve, reject) => {
+        stream = new TransformStream(
+            {
+                start(controller) {
+                    counter.add(resp.length)
+                    controller.enqueue(resp)
+                },
+                transform(chunk, controller) {
+                    counter.add(chunk.length)
+                    controller.enqueue(chunk)
+                },
+                cancel(reason) {
+                    reject(`download cancelled: ${reason}`)
+                },
+            },
+            null,
+            new ByteLengthQueuingStrategy({ highWaterMark: BUFFER_SIZE }),
+        )
+        remote_readable.pipeTo(stream.writable).catch(reject).finally(resolve)
+    })
+
+    return {
+        readable: stream.readable,
+        counter,
+        done,
+    }
+}
+
+async function connect_to_remote(vless, ...remotes) {
+    const hostname = remotes.shift()
+    if (!hostname || hostname.length < 1) {
+        return null
+    }
+
+    const retry = () => connect_to_remote(vless, ...remotes)
+    let remote
+    try {
+        remote = connect({ hostname: hostname, port: vless.port })
+        await remote.opened
+    } catch (err) {
+        return await retry()
+    }
+
+    const uploader = create_uploader(vless, remote.writable)
+    const downloader = create_downloader(vless.resp, remote.readable)
+    return {
+        downloader,
+        uploader,
+    }
+}
+
+async function handle_xhttp_client(body, cfg) {
+    if (ACTIVE_CONNECTIONS >= MAX_CONCURRENT) {
+        return null
+    }
+
+    ACTIVE_CONNECTIONS++
+    let cleaned = false
+
+    const cleanup = () => {
+        if (!cleaned) {
+            ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1)
+            cleaned = true
+        }
+    }
+
+    const vless = await read_vless_header(body, cfg.UUID)
+    if (typeof vless !== 'object' || !vless) {
+        cleanup()
+        return null
+    }
+
+    const r = await connect_to_remote(vless, vless.hostname, cfg.PROXY)
+    if (r === null) {
+        cleanup()
+        return null
+    }
+
+    const connection_closed = new Promise((resolve, _) => {
+        r.downloader.done
+            .finally(() => r.uploader.done)
+            .finally(() => {
+                cleanup()
+                resolve()
+            })
+    })
+
+    return {
+        readable: r.downloader.readable,
+        closed: connection_closed,
+    }
+}
+
+async function handle_post(request, cfg) {
+    try {
+        return await handle_xhttp_client(request.body, cfg)
+    } catch (err) {
+    }
+    return null
+}
+
+function create_config(url, uuid) {
+    const config = JSON.parse(config_template)
+    const vless = config['outbounds'][0]['settings']['vnext'][0]
+    const stream = config['outbounds'][0]['streamSettings']
+
+    // workers are TLS only!
+    const host = url.hostname
+    const path = url.pathname
+    vless['address'] = host
+    vless['users'][0]['id'] = uuid
+    stream['xhttpSettings']['host'] = host
+    stream['xhttpSettings']['path'] = path.endsWith('/') ? path : `${path}/`
+    stream['tlsSettings']['serverName'] = host
+
+    return JSON.stringify(config)
+}
+
+const config_template = `{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "agentin",
+      "port": 1080,
+      "listen": "127.0.0.1",
+      "protocol": "socks",
+      "settings": {}
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "localhost",
+            "port": 443,
+            "users": [
+              {
+                "id": "",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "tag": "agentout",
+      "streamSettings": {
+        "network": "xhttp",
+        "xhttpSettings": {
+          "mode": "stream-one",
+          "host": "localhost",
+          "path": "/path/",
+          "noGRPCHeader": false,
+          "keepAlivePeriod": 300
+        },
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "localhost",
+          "alpn": [
+            "h2"
+          ]
+        }
+      }
+    }
+  ]
+}`
+
+async function fetch(request, env, ctx) {
+    const cfg = {
+        UUID: env.UUID || UUID,
+        PROXY: env.PROXY || PROXY,
+        CAMO_HOST: env.CAMO_HOST || CAMO_HOST,
+    }
+
+    if (!cfg.UUID) {
+        return new Response(`Error: UUID is empty`)
+    }
+
+    if (request.method === 'POST') {
+        const r = await handle_post(request, cfg)
+        if (r) {
+            ctx.waitUntil(r.closed)
+            return new Response(r.readable, {
+                headers: {
+                    'X-Accel-Buffering': 'no',
+                    'Cache-Control': 'no-store',
+                    Connection: 'keep-alive',
+                    'User-Agent': 'Go-http-client/2.0',
+                    'Content-Type': 'application/grpc',
+                },
+            })
+        }
+    }
+
+    if (request.method === 'GET') {
+        const url = new URL(request.url)
+        const items = [url.pathname, url.search]
+        for (let item of items) {
+            if (item.indexOf(`${cfg.UUID}`) >= 0) {
+                const config = create_config(url, cfg.UUID)
+                return new Response(config, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                })
+            }
+        }
+    }
+
+    const newUrl = new URL(request.url)
+    newUrl.hostname = cfg.CAMO_HOST
+    const camoRequest = new Request(newUrl, request)
+    camoRequest.headers.set('Host', cfg.CAMO_HOST)
+    return fetch(camoRequest)
+}
+
+export default {
+    fetch,
+
+    // for unit testing
+    parse_uuid,
+    validate_uuid,
+    concat_typed_arrays,
+}
