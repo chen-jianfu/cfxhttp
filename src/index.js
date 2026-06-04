@@ -7,7 +7,7 @@ from 'cloudflare:sockets';
 // 全局配置与常量
 // ============================================================================
 const DEFAULT_UUID = '96c50e3a-5b87-49dd-bd20-03c7f2735e40';
-const CF_FALLBACK_IPS = ['ProxyIP.US.CMLiussss.net', 'ProxyIP.Multacom.CMLiussss.net'];
+const CF_FALLBACK_IPS = ['ProxyIP.US.CMLiussss.net'];
 
 const PROTO_VER = 0;
 const TYPE_TCP = 1;
