@@ -250,11 +250,9 @@ ctx.waitUntil((async () => {
 })());
 
  // ==========================================================
-// 🔵 下行流量 (Server -> Client) : 完美的 C++ 原生零拷贝
+// 🔵 下行流量 (Server -> Client) 原生零拷贝通道 (0 CPU 消耗)
 // ==========================================================
-            // ==========================================================
-            // 🔵 下行流量：原生零拷贝通道 (0 CPU 消耗)
-            // ==========================================================
+
             const feedbackHead = new Uint8Array([headerInfo.ver, 0]);
             const { readable: outputStream, writable: internalLink } = new TransformStream();
             
@@ -264,7 +262,7 @@ ctx.waitUntil((async () => {
                     await feedbackWriter.write(feedbackHead);
                     feedbackWriter.releaseLock(); 
                     
-                    await egressSocket.readable.pipeTo(internalLink, { preventAbort: true }); 
+                    await egressSocket.readable.pipeTo(internalLink, { preventAbort: true ,preventClose: true}); 
                 } catch (e) {
                 }
             })());
