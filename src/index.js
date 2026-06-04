@@ -4,7 +4,7 @@ import { connect } from 'cloudflare:sockets';
 // 全局配置与常量
 // ============================================================================
 const DEFAULT_UUID = '96c50e3a-5b87-49dd-bd20-03c7f2735e40';
-const CF_FALLBACK_IPS =['ProxyIP.Multacom.CMLiussss.net', '[2a00:1098:2b::1:6815:5881]'];
+const CF_FALLBACK_IPS =['ProxyIP.US.CMLiussss.net','ProxyIP.Multacom.CMLiussss.net'];
 
 const PROTO_VER = 0;
 const TYPE_TCP = 1;
@@ -220,43 +220,38 @@ export default {
             }
 
 // ==========================================================
-            // 🟢 上行流量：组合流优雅版 (实时透传，拒绝死锁)
-            // ==========================================================
-            ctx.waitUntil((async () => {
-                try {
-                    const combinedStream = new ReadableStream({
-                        async start(controller) {
-                            if (headerInfo.initialData.length > 0) {
-                                controller.enqueue(headerInfo.initialData);
-                            }
-                        },
-                        async pull(controller) {
-                            try {
-                                const { done, value } = await ingressReader.read();
-                                if (done) {
-                                    controller.close();
-                                } else {
-                                    controller.enqueue(value);
-                                }
-                            } catch (err) {
-                                controller.error(err);
-                            }
-                        },
-                        cancel(reason) {
-                            ingressReader.cancel(reason).catch(() => {});
-                        }
-                    });
+// ==========================================================
+const egressWriter = egressSocket.writable.getWriter();
+ctx.waitUntil((async () => {
+    try {
+        if (headerInfo.initialData.length > 0) {
+            await egressWriter.write(headerInfo.initialData);
+        }
+        
+        while (true) {
+            const { done, value } = await ingressReader.read();
+            if (done) break;
+            
+            // 🚀 正统背压黑科技：等待写入通道“准备好”
+            // 如果底层 TCP 缓冲区慢了，这里会安全地挂起，绝不盲目堆积内存
+            await egressWriter.ready;
+            
+            // 此时通道畅通，直接写入。为了捕获潜在的网络错误，
+            // 我们可以不用同步 await 它，因为下一轮循环的 await egressWriter.ready 会负责兜住状态。
+            // 但最稳妥的做法依然是直接 write，利用 ready 控速
+            egressWriter.write(value).catch(() => {}); 
+        }
+    } catch (e) {
+        // 忽略正常断开
+    } finally {
+        try { egressWriter.releaseLock(); } catch {}
+        try { egressSocket.close(); } catch {}
+    }
+})());
 
-                    // 实时泵送，利用原生底层的背压控制流速
-                    await combinedStream.pipeTo(egressSocket.writable, { preventClose: true });
-
-                } catch (e) {
-                    // 忽略管道正常断开的错误
-                } finally {
-                    try { egressSocket.close(); } catch {}
-                }
-            })());
-
+ // ==========================================================
+// 🔵 下行流量 (Server -> Client) : 完美的 C++ 原生零拷贝
+// ==========================================================
             // ==========================================================
             // 🔵 下行流量：原生零拷贝通道 (0 CPU 消耗)
             // ==========================================================
@@ -274,14 +269,17 @@ export default {
                 }
             })());
 
-            return new Response(outputStream, {
-                status: 200,
-                headers: { 
-                    'Connection': 'keep-alive', 
-                    'Content-Type': 'application/octet-stream', 
-                    'X-Relay-Status': 'Active' 
-                }
-            });
+
+
+// 返回零拷贝的 outputStream，交给 Cloudflare 基础架构去跑
+return new Response(outputStream, {
+    status: 200,
+    headers: { 
+        'Connection': 'keep-alive', 
+        'Content-Type': 'application/octet-stream', 
+        'X-Relay-Status': 'Active' 
+    }
+});
 
         } catch (err) {
             try { ingressReader.releaseLock(); } catch {}
