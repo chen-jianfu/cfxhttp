@@ -224,52 +224,65 @@ export default {
 const egressWriter = egressSocket.writable.getWriter();
 ctx.waitUntil((async () => {
     try {
+        // 1. 吐出首帧
         if (headerInfo.initialData.length > 0) {
             await egressWriter.write(headerInfo.initialData);
         }
         
+        // 2. 极简高效泵送
         while (true) {
             const { done, value } = await ingressReader.read();
             if (done) break;
-            
-            // 🚀 正统背压黑科技：等待写入通道“准备好”
-            // 如果底层 TCP 缓冲区慢了，这里会安全地挂起，绝不盲目堆积内存
-            await egressWriter.ready;
-            
-            // 此时通道畅通，直接写入。为了捕获潜在的网络错误，
-            // 我们可以不用同步 await 它，因为下一轮循环的 await egressWriter.ready 会负责兜住状态。
-            // 但最稳妥的做法依然是直接 write，利用 ready 控速
-            egressWriter.write(value).catch(() => {}); 
+            await egressWriter.write(value);
         }
     } catch (e) {
-        // 忽略正常断开
+        // 忽略传输过程中的网络断开错误
     } finally {
-        try { egressWriter.releaseLock(); } catch {}
-        try { egressSocket.close(); } catch {}
+        // 3. 双向安全释放：确保两端彻底闭环
+        try { ingressReader.cancel().catch(() => {}); } catch (e) {} // 核心：防止前端连接半悬挂
+        try { egressWriter.releaseLock(); } catch (e) {}
+        try { egressSocket.close(); } catch (e) {}
     }
 })());
 
- // ==========================================================
-// 🔵 下行流量 (Server -> Client) 原生零拷贝通道 (0 CPU 消耗)
 // ==========================================================
+// 🔵 下行流量 (Server -> Client) : 对称的背压感知异步泵
+// ==========================================================
+const feedbackHead = new Uint8Array([headerInfo.ver, 0]);
+// 创建一个中转流，readable 给 Response 返回给客户端，writable 留给我们用 JS 写入
+const { readable: outputStream, writable: clientWritable } = new TransformStream();
 
-            const feedbackHead = new Uint8Array([headerInfo.ver, 0]);
-            const { readable: outputStream, writable: internalLink } = new TransformStream();
+ctx.waitUntil((async () => {
+    // 获取服务端的读取器和客户端的写入器
+    const serverReader = egressSocket.readable.getReader();
+    const clientWriter = clientWritable.getWriter();
+
+    try {
+        // 1. 先把 VLESS 响应头塞给客户端
+        await clientWriter.write(feedbackHead);
+        
+        // 2. 开始 JS 显式循环搬运（远端服务器 -> 客户端）
+        while (true) {
+            const { done, value } = await serverReader.read();
+            if (done) break;
             
-            ctx.waitUntil((async () => {
-                try {
-                    const feedbackWriter = internalLink.getWriter();
-                    await feedbackWriter.write(feedbackHead);
-                    feedbackWriter.releaseLock(); 
-                    
-                    await egressSocket.readable.pipeTo(internalLink, { preventAbort: true ,preventClose: true}); 
-                } catch (e) {
-                }
-            })());
+            // 控速挂起，等待客户端接收通道准备就绪
+            await clientWriter.ready;
+            
+            // 异步写入给客户端，通过 catch 兜住客户端可能随时断开的异常
+            clientWriter.write(value).catch(() => {}); 
+        }
+    } catch (e) {
+        // 忽略传输过程中的网络断开错误
+    } finally {
+        // 双向安全释放：确保远端读取停止，且向客户端的写入流正常结束
+        try { serverReader.cancel().catch(() => {}); } catch {}
+        // 注意这里：直接 close() writer 可以让 HTTP 响应正常结束，告诉客户端下载完毕
+        try { clientWriter.close(); } catch {} 
+    }
+})());
 
-
-
-// 返回零拷贝的 outputStream，交给 Cloudflare 基础架构去跑
+// 返回 outputStream，里面是我们用 JS 循环一点点 write 进去的数据
 return new Response(outputStream, {
     status: 200,
     headers: { 
@@ -278,6 +291,10 @@ return new Response(outputStream, {
         'X-Relay-Status': 'Active' 
     }
 });
+
+
+
+
 
         } catch (err) {
             try { ingressReader.releaseLock(); } catch {}
