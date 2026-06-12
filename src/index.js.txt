@@ -1,533 +1,386 @@
-import { connect } from 'cloudflare:sockets'
+import { connect } from 'cloudflare:sockets';
 
-// configurations
-const UUID = '5dc15e15-f285-4a9d-959b-0e4fbdd77b63' //
-const PROXY = 'ProxyIP.US.CMLiussss.net' // 
-const LOG_LEVEL = 'info' // debug, info, error, none
+// ============================================================================
+// 全局配置与常量
+// ============================================================================
+const DEFAULT_UUID = '96c50e3a-5b87-49dd-bd20-03c7f2735e40';
+const CF_FALLBACK_IPS = ['ProxyIP.US.CMLiussss.net'];
 
-// source code
-const TIME_ZONE = 8 * 60 * 60 * 1000 // logging timestamp forwards 8 hours
-const BUFFER_SIZE = 64 * 1024 // download/upload buffer size in bytes
-const MAX_CONCURRENT = 64
-let ACTIVE_CONNECTIONS = 0
+const PROTO_VER = 0;
+const TYPE_TCP = 1;
+const TYPE_UDP = 2;
+const ADDR_V4 = 1;
+const ADDR_DNS = 2;
+const ADDR_V6 = 3;
 
-function to_size(size) {
-    const KiB = 1024
-    const min = 1.1 * KiB
-    let i = 0
-    const SIZE_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
-    for (; i < SIZE_UNITS.length; i++) {
-        if (size < min) {
-            break
+const NGINX_HTML = `<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>`;
+
+const TEXT_DECODER = new TextDecoder();
+let CACHED_UUID = '';
+let AUTH_CHUNKS = new Uint8Array(16);
+
+
+function checkAuth(buffer, offset) {
+    return buffer[offset]      === AUTH_CHUNKS[0]  &&
+           buffer[offset + 1]  === AUTH_CHUNKS[1]  &&
+           buffer[offset + 2]  === AUTH_CHUNKS[2]  &&
+           buffer[offset + 3]  === AUTH_CHUNKS[3]  &&
+           buffer[offset + 4]  === AUTH_CHUNKS[4]  &&
+           buffer[offset + 5]  === AUTH_CHUNKS[5]  &&
+           buffer[offset + 6]  === AUTH_CHUNKS[6]  &&
+           buffer[offset + 7]  === AUTH_CHUNKS[7]  &&
+           buffer[offset + 8]  === AUTH_CHUNKS[8]  &&
+           buffer[offset + 9]  === AUTH_CHUNKS[9]  &&
+           buffer[offset + 10] === AUTH_CHUNKS[10] &&
+           buffer[offset + 11] === AUTH_CHUNKS[11] &&
+           buffer[offset + 12] === AUTH_CHUNKS[12] &&
+           buffer[offset + 13] === AUTH_CHUNKS[13] &&
+           buffer[offset + 14] === AUTH_CHUNKS[14] &&
+           buffer[offset + 15] === AUTH_CHUNKS[15];
+}
+
+function isCFError(err) {
+    const msg = err?.message?.toLowerCase() || '';
+    return msg.includes('proxy request') || 
+           msg.includes('cannot connect') || 
+           msg.includes('cloudflare');
+}
+
+
+function mergeUint8Array(a, b) {
+    const res = new Uint8Array(a.length + b.length);
+    res.set(a);
+    res.set(b, a.length);
+    return res;
+}
+
+
+// ============================================================================
+async function resolveHeader(streamReader) {
+    let buffer = new Uint8Array(4096); 
+    let offset = 0;
+
+    const requireBytes = async (length) => {
+        while (offset < length) {
+            const { value, done } = await streamReader.read();
+            if (done) return false;
+            
+            if (offset + value.length > buffer.length) {
+                const newSize = Math.max(buffer.length * 2, offset + value.length);
+                const newBuffer = new Uint8Array(newSize);
+                newBuffer.set(buffer);
+                buffer = newBuffer;
+            }
+            
+            buffer.set(value, offset);
+            offset += value.length;
         }
-        size = size / KiB
-    }
-    return `${Math.floor(size)} ${SIZE_UNITS[i]}`
-}
+        return true;
+    };
 
-function validate_uuid(id, uuid) {
-    for (let index = 0; index < 16; index++) {
-        const v = id[index]
-        const u = uuid[index]
-        if (v !== u) {
-            return false
+    if (!(await requireBytes(18))) return null;
+    if (buffer[0] !== PROTO_VER) return { error: 'Err:V' };
+    if (!checkAuth(buffer, 1)) return { error: 'Err:A' };
+
+    const metaLen = buffer[17];
+    const addrTypeIdx = 18 + metaLen + 2; 
+    
+    if (!(await requireBytes(addrTypeIdx + 1))) return null;
+
+    const action = buffer[18 + metaLen];
+    if (action !== TYPE_TCP && action !== TYPE_UDP) return { error: `Err:C-${action}` };
+
+    const portIdx = 18 + metaLen + 1;
+    const port = (buffer[portIdx] << 8) | buffer[portIdx + 1];
+    const addrType = buffer[portIdx + 2];
+    const addrStart = portIdx + 3;
+
+    let targetAddr = '';
+    let payloadStart = 0;
+
+    if (addrType === ADDR_V4) {
+        payloadStart = addrStart + 4;
+        if (!(await requireBytes(payloadStart))) return null;
+        targetAddr = `${buffer[addrStart]}.${buffer[addrStart+1]}.${buffer[addrStart+2]}.${buffer[addrStart+3]}`;
+        
+    } else if (addrType === ADDR_DNS) {
+        if (!(await requireBytes(addrStart + 1))) return null;
+        const dnsLen = buffer[addrStart];
+        payloadStart = addrStart + 1 + dnsLen;
+        if (!(await requireBytes(payloadStart))) return null;
+        targetAddr = TEXT_DECODER.decode(buffer.subarray(addrStart + 1, payloadStart));
+        
+    } else if (addrType === ADDR_V6) {
+        payloadStart = addrStart + 16;
+        if (!(await requireBytes(payloadStart))) return null;
+        const parts = [];
+        for (let i = 0; i < 16; i += 2) {
+            parts.push(((buffer[addrStart + i] << 8) | buffer[addrStart + i + 1]).toString(16));
         }
-    }
-    return true
-}
-
-class Counter {
-    #total
-
-    constructor() {
-        this.#total = 0
-    }
-
-    get() {
-        return this.#total
-    }
-
-    add(size) {
-        this.#total += size
-    }
-}
-
-function concat_typed_arrays(first, ...args) {
-    let len = first.length
-    for (let a of args) {
-        len += a.length
-    }
-    const r = new first.constructor(len)
-    r.set(first, 0)
-    len = first.length
-    for (let a of args) {
-        r.set(a, len)
-        len += a.length
-    }
-    return r
-}
-
-class Logger {
-    #id
-    #level
-
-    constructor(log_level) {
-        this.#id = random_id()
-
-        if (typeof log_level !== 'string') {
-            log_level = 'info'
-        }
-        const levels = ['debug', 'info', 'error', 'none']
-        this.#level = levels.indexOf(log_level.toLowerCase())
-    }
-
-    debug(...args) {
-        if (this.#level < 1) {
-            this.#log(`[debug]`, ...args)
-        }
-    }
-
-    info(...args) {
-        if (this.#level < 2) {
-            this.#log(`[info ]`, ...args)
-        }
-    }
-
-    error(...args) {
-        if (this.#level < 3) {
-            this.#log(`[error]`, ...args)
-        }
-    }
-
-    #log(prefix, ...args) {
-        const now = new Date(Date.now() + TIME_ZONE).toISOString()
-        console.log(now, prefix, `(${this.#id})`, ...args)
-    }
-}
-
-function random_id() {
-    const min = 10000
-    const max = min * 10 - 1
-    return Math.floor(Math.random() * (max - min + 1)) + min
-}
-
-function parse_uuid(uuid) {
-    uuid = uuid.replaceAll('-', '')
-    const r = []
-    for (let index = 0; index < 16; index++) {
-        const v = parseInt(uuid.substr(index * 2, 2), 16)
-        r.push(v)
-    }
-    return r
-}
-
-function get_buffer(size) {
-    return new Uint8Array(new ArrayBuffer(size || BUFFER_SIZE))
-}
-
-// enums
-const ADDRESS_TYPE_IPV4 = 1
-const ADDRESS_TYPE_URL = 2
-const ADDRESS_TYPE_IPV6 = 3
-
-async function read_vless_header(readable, uuid_str) {
-    const reader = readable.getReader({ mode: 'byob' })
-
-    let r = await reader.readAtLeast(1 + 16 + 1, get_buffer())
-    let rlen = 0
-    let idx = 0
-    let cache = r.value
-    rlen += r.value.length
-
-    const version = cache[0]
-    const id = cache.slice(1, 1 + 16)
-    const uuid = parse_uuid(uuid_str)
-    if (!validate_uuid(id, uuid)) {
-        return `invalid UUID`
-    }
-    const pb_len = cache[1 + 16]
-    const addr_plus1 = 1 + 16 + 1 + pb_len + 1 + 2 + 1
-
-    if (addr_plus1 + 1 > rlen) {
-        if (r.done) {
-            return `header too short`
-        }
-        idx = addr_plus1 + 1 - rlen
-        r = await reader.readAtLeast(idx, get_buffer())
-        rlen += r.value.length
-        cache = concat_typed_arrays(cache, r.value)
-    }
-
-    const cmd = cache[1 + 16 + 1 + pb_len]
-    if (cmd !== 1) {
-        return `unsupported command: ${cmd}`
-    }
-    const port = (cache[addr_plus1 - 1 - 2] << 8) + cache[addr_plus1 - 1 - 1]
-    const atype = cache[addr_plus1 - 1]
-    let header_len = -1
-    if (atype === ADDRESS_TYPE_IPV4) {
-        header_len = addr_plus1 + 4
-    } else if (atype === ADDRESS_TYPE_IPV6) {
-        header_len = addr_plus1 + 16
-    } else if (atype === ADDRESS_TYPE_URL) {
-        header_len = addr_plus1 + 1 + cache[addr_plus1]
-    }
-
-    if (header_len < 0) {
-        return 'read address type failed'
-    }
-
-    idx = header_len - rlen
-    if (idx > 0) {
-        if (r.done) {
-            return `read address failed`
-        }
-        r = await reader.readAtLeast(idx, get_buffer())
-        rlen += r.value.length
-        cache = concat_typed_arrays(cache, r.value)
-    }
-
-    let hostname = ''
-    idx = addr_plus1
-    switch (atype) {
-        case ADDRESS_TYPE_IPV4:
-            hostname = cache.slice(idx, idx + 4).join('.')
-            break
-        case ADDRESS_TYPE_URL:
-            hostname = new TextDecoder().decode(
-                cache.slice(idx + 1, idx + 1 + cache[idx]),
-            )
-            break
-        case ADDRESS_TYPE_IPV6:
-            hostname = cache
-                .slice(idx, idx + 16)
-                .reduce(
-                    (s, b2, i2, a) =>
-                        i2 % 2
-                            ? s.concat(((a[i2 - 1] << 8) + b2).toString(16))
-                            : s,
-                    [],
-                )
-                .join(':')
-            break
-    }
-
-    if (hostname.length < 1) {
-        return 'failed to parse hostname'
-    }
-
-    const data = cache.slice(header_len)
-    return {
-        hostname,
-        port,
-        data,
-        resp: new Uint8Array([version, 0]),
-        reader,
-        done: r.done,
-    }
-}
-
-async function upload_to_remote(counter, log, writer, vless) {
-    async function inner_upload(d, src) {
-        if (!d) {
-            log.debug(`upload detect null ${src}`)
-        }
-        counter.add(d.length)
-        log.debug(`upload ${src}: ${to_size(d.length)}`)
-        await writer.write(d)
-    }
-
-    try {
-        await inner_upload(vless.data, 'first packet')
-        while (!vless.done) {
-            const r = await vless.reader.read(get_buffer())
-            await inner_upload(r.value, 'remain packets')
-            vless.done = r.done
-        }
-    } catch (err) {
-        log.error(`upload error: ${err}`)
-        throw err
-    } finally {
-        try {
-            await writer.close()
-        } catch (_) {
-            // ignore error
-        }
-    }
-}
-
-function create_uploader(log, vless, writable) {
-    const counter = new Counter()
-    const done = new Promise((resolve, reject) => {
-        const writer = writable.getWriter()
-        upload_to_remote(counter, log, writer, vless)
-            .then(resolve)
-            .catch(reject)
-            .finally(() => {
-                writer
-                    .close()
-                    .then(() => log.debug(`upload writer closed`))
-                    .catch((err) => log.debug(`upload writer error: ${err}`))
-            })
-    })
-
-    return {
-        counter,
-        done,
-    }
-}
-
-function create_downloader(log, resp, remote_readable) {
-    const counter = new Counter()
-    let stream
-
-    const done = new Promise((resolve, reject) => {
-        stream = new TransformStream(
-            {
-                start(controller) {
-                    log.debug(`copy vless response`)
-                    counter.add(resp.length)
-                    controller.enqueue(resp)
-                },
-                transform(chunk, controller) {
-                    counter.add(chunk.length)
-                    controller.enqueue(chunk)
-                    log.debug(`download: ${to_size(chunk.length)}`)
-                },
-                cancel(reason) {
-                    reject(`download cancelled: ${reason}`)
-                },
-            },
-            null,
-            new ByteLengthQueuingStrategy({ highWaterMark: BUFFER_SIZE }),
-        )
-        remote_readable.pipeTo(stream.writable).catch(reject).finally(resolve)
-    })
-
-    return {
-        readable: stream.readable,
-        counter,
-        done,
-    }
-}
-
-async function connect_to_remote(log, vless, ...remotes) {
-    const hostname = remotes.shift()
-    if (!hostname || hostname.length < 1) {
-        log.info('all attempts failed')
-        return null
-    }
-
-    if (vless.hostname === hostname) {
-        log.info(`direct connect [${vless.hostname}]:${vless.port}`)
+        targetAddr = `[${parts.join(':')}]`;
     } else {
-        log.info(`proxy [${vless.hostname}]:${vless.port} through ${hostname}`)
+        return { error: `Err:T-${addrType}` };
     }
 
-    const retry = () => connect_to_remote(log, vless, ...remotes)
-    let remote
-    try {
-        remote = connect({ hostname: hostname, port: vless.port })
-        const info = await remote.opened
-        log.debug(`connection opened:`, info)
-    } catch (err) {
-        log.error(`retry [${vless.hostname}] reason: ${err}`)
-        return await retry()
-    }
-
-    const uploader = create_uploader(log, vless, remote.writable)
-    const downloader = create_downloader(log, vless.resp, remote.readable)
-    return {
-        downloader,
-        uploader,
-    }
+    const initialData = offset > payloadStart ? buffer.slice(payloadStart, offset) : new Uint8Array(0);
+    return { targetAddr, port, initialData, ver: buffer[0], action };
 }
 
-async function handle_xhttp_client(log, body, cfg) {
-    if (ACTIVE_CONNECTIONS >= MAX_CONCURRENT) {
-        log.error('Too many connections')
-        return null
-    }
-
-    ACTIVE_CONNECTIONS++
-    let cleaned = false
-
-    const cleanup = () => {
-        if (!cleaned) {
-            ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1)
-            cleaned = true
-        }
-    }
-
-    const vless = await read_vless_header(body, cfg.UUID)
-    if (typeof vless !== 'object' || !vless) {
-        // to-do: drain connection
-        log.error(`failed to parse vless header: ${vless}`)
-        cleanup()
-        return null
-    }
-
-    const r = await connect_to_remote(log, vless, vless.hostname, cfg.PROXY)
-    if (r === null) {
-        log.error('create remote stream failed')
-        cleanup()
-        return null
-    }
-
-    const connection_closed = new Promise((resolve, _) => {
-        r.downloader.done
-            .then(() => log.debug(`download complete`))
-            .catch((err) => log.error(`download error: ${err}`))
-            .finally(() => r.uploader.done)
-            .then(() => log.debug(`upload complete`))
-            .catch((err) => log.debug(`upload error: ${err}`))
-            .finally(() => {
-                cleanup()
-                const total_upload = to_size(r.uploader.counter.get())
-                const total_download = to_size(r.downloader.counter.get())
-                log.info(
-                    `connection closed. uploaded: ${total_upload} downloaded: ${total_download}`,
-                )
-                resolve()
-            })
-    })
-
-    return {
-        readable: r.downloader.readable,
-        closed: connection_closed,
-    }
-}
-
-async function handle_post(request, cfg) {
-    const log = new Logger(cfg.LOG_LEVEL)
-    try {
-        return await handle_xhttp_client(log, request.body, cfg)
-    } catch (err) {
-        log.error(`error: ${err}`)
-    }
-    return null
-}
-
-function create_config(url, uuid) {
-    const config = JSON.parse(config_template)
-    const vless = config['outbounds'][0]['settings']['vnext'][0]
-    const stream = config['outbounds'][0]['streamSettings']
-
-    // workers are TLS only!
-    const host = url.hostname
-    const path = url.pathname
-    vless['address'] = host
-    vless['users'][0]['id'] = uuid
-    stream['xhttpSettings']['host'] = host
-    stream['xhttpSettings']['path'] = path.endsWith('/') ? path : `${path}/`
-    stream['tlsSettings']['serverName'] = host
-
-    return JSON.stringify(config)
-}
-
-const config_template = `{
-  "log": {
-    "loglevel": "warning"
-  },
-  "inbounds": [
-    {
-      "tag": "agentin",
-      "port": 1080,
-      "listen": "127.0.0.1",
-      "protocol": "socks",
-      "settings": {}
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "vless",
-      "settings": {
-        "vnext": [
-          {
-            "address": "localhost",
-            "port": 443,
-            "users": [
-              {
-                "id": "",
-                "encryption": "none"
-              }
-            ]
-          }
-        ]
-      },
-      "tag": "agentout",
-      "streamSettings": {
-        "network": "xhttp",
-        "xhttpSettings": {
-          "mode": "stream-one",
-          "host": "localhost",
-          "path": "/path/",
-          "noGRPCHeader": false,
-          "keepAlivePeriod": 300
-        },
-        "security": "tls",
-        "tlsSettings": {
-          "serverName": "localhost",
-          "alpn": [
-            "h2"
-          ]
-        }
-      }
-    }
-  ]
-}`
-
-async function fetch(request, env, ctx) {
-    const cfg = {
-        UUID: env.UUID || UUID,
-        PROXY: env.PROXY || PROXY,
-        LOG_LEVEL: env.LOG_LEVEL || LOG_LEVEL,
-    }
-
-    if (!cfg.UUID) {
-        return new Response(`Error: UUID is empty`)
-    }
-
-    if (request.method === 'POST') {
-        const r = await handle_post(request, cfg)
-        if (r) {
-            ctx.waitUntil(r.closed)
-            return new Response(r.readable, {
-                headers: {
-                    'X-Accel-Buffering': 'no',
-                    'Cache-Control': 'no-store',
-                    Connection: 'keep-alive',
-                    'User-Agent': 'Go-http-client/2.0',
-                    'Content-Type': 'application/grpc',
-                    // 'Content-Type': 'text/event-stream',
-                    // 'Transfer-Encoding': 'chunked',
-                },
-            })
-        }
-    }
-
-    if (request.method === 'GET') {
-        const url = new URL(request.url)
-        const items = [url.pathname, url.search]
-        for (let item of items) {
-            if (item.indexOf(`${cfg.UUID}`) >= 0) {
-                const config = create_config(url, cfg.UUID)
-                return new Response(config, {
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                })
+// ============================================================================
+export default {
+    async fetch(request, env, ctx) {
+        const _KEY = env.UUID || DEFAULT_UUID;
+        
+        // 动态缓存 UUID 转换
+        if (_KEY !== CACHED_UUID) {
+            CACHED_UUID = _KEY;
+            const cleanHex = _KEY.replace(/-/g, '');
+            for (let i = 0; i < 16; i++) {
+                AUTH_CHUNKS[i] = parseInt(cleanHex.substring(i * 2, i * 2 + 2), 16);
             }
         }
+        
+        // 🚨 白天模式：伪装防护与订阅下发
+        if (request.method === 'GET') {
+            const url = new URL(request.url);
+            if (url.pathname.includes(_KEY) || url.search.includes(_KEY)) {
+                return new Response(buildSchema(url, _KEY), { headers: { 'Content-Type': 'application/json' } });
+            }
+            // 伪造 Nginx 网页与 Server 响应头
+            return new Response(NGINX_HTML, { 
+                status: 200, 
+                headers: { 
+                    'Content-Type': 'text/html; charset=utf-8',
+                    'Server': 'nginx' 
+                } 
+            });
+        }
+
+        // 🌃 黑夜模式：处理真实的代理请求 (POST 流量)
+        if (request.method !== 'POST') return new Response('Forbidden', { status: 403 });
+
+        const ingressReader = request.body.getReader();
+        
+        try {
+            const headerInfo = await resolveHeader(ingressReader);
+            
+            if (!headerInfo) {
+                try { ingressReader.releaseLock(); } catch {}
+                return new Response('Short Frame', { status: 400 });
+            }
+            if (headerInfo.error) {
+                try { ingressReader.releaseLock(); } catch {}
+                return new Response(headerInfo.error, { status: 400 });
+            }
+
+            // ==========================================================
+            // 🟡 分支 A：UDP 流量 (智能拦截 53 端口做 DoH 解析)
+            // ==========================================================
+            if (headerInfo.action === TYPE_UDP) {
+                if (headerInfo.port !== 53) {
+                    try { ingressReader.releaseLock(); } catch {}
+                    return new Response('UDP not supported', { status: 403 });
+                }
+
+                const { readable: outputStream, writable: internalLink } = new TransformStream();
+                const feedbackWriter = internalLink.getWriter();
+                await feedbackWriter.write(new Uint8Array([headerInfo.ver, 0]));
+
+                ctx.waitUntil((async () => {
+                    let udpBuffer = new Uint8Array(0);
+
+                    const processUdpChunk = async (chunk) => {
+                        udpBuffer = mergeUint8Array(udpBuffer, chunk);
+                        while (udpBuffer.length >= 2) {
+                            const dnsPayloadLen = (udpBuffer[0] << 8) | udpBuffer[1];
+                            if (udpBuffer.length >= 2 + dnsPayloadLen) {
+                                const dnsQuery = udpBuffer.slice(2, 2 + dnsPayloadLen);
+                                udpBuffer = udpBuffer.slice(2 + dnsPayloadLen);
+                                handleDnsQuery(dnsQuery); // 异步触发 DoH
+                            } else {
+                                break; 
+                            }
+                        }
+                    };
+
+                    const handleDnsQuery = async (queryPayload) => {
+                        try {
+                            const resp = await fetch('https://1.1.1.1/dns-query', {
+                                method: 'POST',
+                                headers: { 'content-type': 'application/dns-message' },
+                                body: queryPayload
+                            });
+                            if (!resp.ok) return;
+                            const result = new Uint8Array(await resp.arrayBuffer());
+                            const framed = new Uint8Array(2 + result.length);
+                            framed[0] = result.length >> 8;
+                            framed[1] = result.length & 0xff;
+                            framed.set(result, 2);
+                            await feedbackWriter.write(framed);
+                        } catch (e) {}
+                    };
+
+                    try {
+                        if (headerInfo.initialData.length > 0) {
+                            await processUdpChunk(headerInfo.initialData);
+                        }
+                        while (true) {
+                            const { done, value } = await ingressReader.read();
+                            if (done) break;
+                            await processUdpChunk(value);
+                        }
+                    } catch (e) {
+                    } finally {
+                        try { feedbackWriter.close(); } catch {}
+                    }
+                })());
+
+                return new Response(outputStream, {
+                    status: 200,
+                    headers: { 'Connection': 'keep-alive', 'Content-Type': 'application/octet-stream' }
+                });
+            }
+
+            // ==========================================================
+            // 🟢 分支 B：TCP 流量 (XHTTP 极致双向中继)
+            // ==========================================================
+            let egressSocket = null;
+            let connectionSuccess = false;
+            const fallbackIPs = env.PROXY ? [env.PROXY, ...CF_FALLBACK_IPS] : CF_FALLBACK_IPS;
+            const attempts = [null, ...fallbackIPs];
+
+            // 智能节点回退与阻断探测
+            for (let i = 0; i < attempts.length; i++) {
+                try {
+                    const connectHost = attempts[i] || headerInfo.targetAddr;
+                    egressSocket = connect({ hostname: connectHost, port: headerInfo.port });
+                    await egressSocket.opened;
+                    connectionSuccess = true;
+                    break; 
+                } catch (err) {
+                    try { egressSocket?.close(); } catch {}
+                    if (!isCFError(err) || i === attempts.length - 1) {
+                        try { ingressReader.releaseLock(); } catch {}
+                        return new Response(`Connection Failed`, { status: 502 });
+                    }
+                }
+            }
+
+            if (!connectionSuccess) {
+                try { ingressReader.releaseLock(); } catch {}
+                return new Response('Failed', { status: 502 });
+            }
+
+            // --- ⬆️ 上行：稳健背压感知异步泵 (含防丢尾与 ready 控制) ---
+            const egressWriter = egressSocket.writable.getWriter();
+            ctx.waitUntil((async () => {
+                try {
+                    let lastWritePromise = null;
+
+                    if (headerInfo.initialData.length > 0) {
+                        lastWritePromise = egressWriter.write(headerInfo.initialData).catch(() => {});
+                    }
+                    
+                    while (true) {
+                        const { done, value } = await ingressReader.read();
+                        if (done) break;
+                        
+                        // 优雅的控速挂起：只有底层通道准备就绪才继续
+                        await egressWriter.ready;
+                        
+                        // 异步写入，并必须记录下最后一个 Promise！
+                        lastWritePromise = egressWriter.write(value).catch(() => {}); 
+                    }
+                    
+                    // 🛡️ 防丢尾保护：死等最后一块数据安全送达网络栈
+                    if (lastWritePromise) {
+                        await lastWritePromise;
+                    }
+
+                } catch (e) {
+                    // 忽略正常网络断开
+                } finally {
+                    try { ingressReader.cancel().catch(() => {}); } catch {}
+                    try { egressWriter.releaseLock(); } catch {}
+                    try { egressSocket.close(); } catch {}
+                }
+            })());
+
+            // --- ⬇️ 下行：完美的 C++ 原生零拷贝 (防连坐崩溃) ---
+            const feedbackHead = new Uint8Array([headerInfo.ver, 0]);
+            const { readable: outputStream, writable: internalLink } = new TransformStream();
+
+            ctx.waitUntil((async () => {
+                try {
+                    const feedbackWriter = internalLink.getWriter();
+                    await feedbackWriter.write(feedbackHead);
+                    feedbackWriter.releaseLock(); // 极其重要：立马放锁！
+                    
+                    // 将远端 Socket 的读端，零拷贝管接给客户端的响应流
+                    // ✅ 保留 preventAbort 防底层暴力重置引发 500 崩溃
+                    // ❌ 绝不能加 preventClose，否则无限转圈
+                    await egressSocket.readable.pipeTo(internalLink, { 
+                        preventAbort: true 
+                    }); 
+                } catch (e) {
+                    // 忽略断开错误
+                } 
+            })());
+
+            return new Response(outputStream, {
+                status: 200,
+                headers: { 
+                    'Connection': 'keep-alive', 
+                    'Content-Type': 'application/octet-stream', 
+                    'X-Relay-Status': 'Active' 
+                }
+            });
+
+        } catch (err) {
+            try { ingressReader.releaseLock(); } catch {}
+            return new Response('Internal Pipeline Error', { status: 500 });
+        }
     }
-    return new Response(`Hello world!`)
-}
+};
 
-export default {
-    fetch,
 
-    // for unit testing
-    parse_uuid,
-    validate_uuid,
-    concat_typed_arrays,
+// ============================================================================
+function buildSchema(url, key) {
+    const sHost = url.hostname;
+    const sPath = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
+    return JSON.stringify({
+        "service": "Data-Forwarder",
+        "engine": { "level": "stable" },
+        "in": [{ "port": 1080, "type": "bridge" }],
+        "out": [{
+            "type": "tunnel",
+            "params": { "endpoint": sHost, "port": 443, "auth": [{ "token": key }] },
+            "transport": {
+                "proto": "xhttp",
+                "options": { "mode": "stream", "host": sHost, "path": sPath },
+                "tls": { "sni": sHost }
+            }
+        }]
+    }, null, 2);
 }
