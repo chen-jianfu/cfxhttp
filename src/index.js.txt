@@ -403,8 +403,7 @@ export default {
 
                     // 2. 【关键修复】：同样移除防断流参数
                     await egressSocket.readable.pipeTo(internalLink, {
-                        preventAbort: true,
-                        preventClose: true
+                        preventAbort: true
                     });
 
                 } catch (e) {
