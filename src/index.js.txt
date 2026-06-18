@@ -354,65 +354,39 @@ export default {
                 });
             }
 
-            ===
-            === === === === === === === === === === === === === === === === === === =
-
-            // 🚀 终极版上行流量中继 (零拷贝 + 强力防断流)
 
             // ==========================================================
-
+            // 🚀 修复版上行流量中继 (Client -> Server)
+            // ==========================================================
             const egressWriter = egressSocket.writable.getWriter();
 
-
-
             ctx.waitUntil((async () => {
-
                 try {
-
-                    // 1. 发送解析头部时多读出来的首帧数据
-
+                    // 1. 发送首帧残留数据
                     if (headerInfo.initialData.length > 0) {
-
                         await egressWriter.write(headerInfo.initialData);
-
                     }
 
-
-
-                    // 2. 【核心动作】：彻底交出 JS 引擎对这两个流的控制权
-
+                    // 2. 释放锁
                     egressWriter.releaseLock();
-
                     ingressReader.releaseLock();
 
-
-
-                    // 3. 【底层黑科技】：使用原生 C++ 管道拼接
-
-                    // preventClose: true -> 绝对不能省略！防止客户端结束请求时连累 Socket 被关
-
-                    // preventAbort: true -> 防止客户端意外断开时导致整体崩溃
-
+                    // 3. 【关键修复】：移除 preventClose 和 preventAbort！
+                    // 让客户端主动断开时，自然触发 egressSocket.writable 的关闭
                     await request.body.pipeTo(egressSocket.writable, {
-
                         preventClose: true,
-
                         preventAbort: true
-
                     });
 
-
-
                 } catch (e) {
-
-                    // 忽略网络断开引起的底层报错
-
+                    // 【关键修复】：如果上行管道崩溃，强制切断与真实服务器的 Socket 物理连接
+                    // 不留任何产生僵尸等待的隐患
+                    try { egressSocket.close(); } catch (err) {}
                 }
-
-            })()); //
+            })());
 
             // ==========================================================
-            // 🔵 下行流量 (Server -> Client) : 完美的 C++ 原生零拷贝
+            // 🔵 修复版下行流量 (Server -> Client)
             // ==========================================================
             const feedbackHead = new Uint8Array([headerInfo.ver, 0]);
             const {
@@ -423,23 +397,24 @@ export default {
             ctx.waitUntil((async () => {
                 try {
                     const feedbackWriter = internalLink.getWriter();
-                    // 1. 优雅塞入 VLESS 响应头
+                    // 1. 塞入 VLESS 响应头
                     await feedbackWriter.write(feedbackHead);
-                    feedbackWriter.releaseLock(); // 极其重要：立马放锁！
+                    feedbackWriter.releaseLock(); 
 
-                    // 2. 将远端 Socket 的读端，零拷贝管接给客户端的响应流
-                    // 加上双 prevent 强力防断流/异常崩溃
+                    // 2. 【关键修复】：同样移除防断流参数
                     await egressSocket.readable.pipeTo(internalLink, {
                         preventAbort: true,
                         preventClose: true
                     });
+
                 } catch (e) {
-                    // 忽略断开错误
+                    // 【关键修复】：下行抛错（比如客户端直接拔网线导致内部流断裂）
+                    // 必须主动中止内部流，并连带杀死远端 Socket
+                    try { internalLink.abort(); } catch (err) {}
+                    try { egressSocket.close(); } catch (err) {}
                 } finally {
                     // 确保下行链路最终闭环释放
-                    try {
-                        internalLink.close();
-                    } catch {}
+                    try { internalLink.close(); } catch {}
                 }
             })());
 
