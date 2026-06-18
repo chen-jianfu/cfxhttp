@@ -1,4 +1,6 @@
-import { connect } from 'cloudflare:sockets';
+import {
+    connect
+} from 'cloudflare:sockets';
 
 // ============================================================================
 // 全局配置与常量
@@ -42,29 +44,29 @@ let AUTH_CHUNKS = new Uint8Array(16);
 
 
 function checkAuth(buffer, offset) {
-    return buffer[offset]      === AUTH_CHUNKS[0]  &&
-           buffer[offset + 1]  === AUTH_CHUNKS[1]  &&
-           buffer[offset + 2]  === AUTH_CHUNKS[2]  &&
-           buffer[offset + 3]  === AUTH_CHUNKS[3]  &&
-           buffer[offset + 4]  === AUTH_CHUNKS[4]  &&
-           buffer[offset + 5]  === AUTH_CHUNKS[5]  &&
-           buffer[offset + 6]  === AUTH_CHUNKS[6]  &&
-           buffer[offset + 7]  === AUTH_CHUNKS[7]  &&
-           buffer[offset + 8]  === AUTH_CHUNKS[8]  &&
-           buffer[offset + 9]  === AUTH_CHUNKS[9]  &&
-           buffer[offset + 10] === AUTH_CHUNKS[10] &&
-           buffer[offset + 11] === AUTH_CHUNKS[11] &&
-           buffer[offset + 12] === AUTH_CHUNKS[12] &&
-           buffer[offset + 13] === AUTH_CHUNKS[13] &&
-           buffer[offset + 14] === AUTH_CHUNKS[14] &&
-           buffer[offset + 15] === AUTH_CHUNKS[15];
+    return buffer[offset] === AUTH_CHUNKS[0] &&
+        buffer[offset + 1] === AUTH_CHUNKS[1] &&
+        buffer[offset + 2] === AUTH_CHUNKS[2] &&
+        buffer[offset + 3] === AUTH_CHUNKS[3] &&
+        buffer[offset + 4] === AUTH_CHUNKS[4] &&
+        buffer[offset + 5] === AUTH_CHUNKS[5] &&
+        buffer[offset + 6] === AUTH_CHUNKS[6] &&
+        buffer[offset + 7] === AUTH_CHUNKS[7] &&
+        buffer[offset + 8] === AUTH_CHUNKS[8] &&
+        buffer[offset + 9] === AUTH_CHUNKS[9] &&
+        buffer[offset + 10] === AUTH_CHUNKS[10] &&
+        buffer[offset + 11] === AUTH_CHUNKS[11] &&
+        buffer[offset + 12] === AUTH_CHUNKS[12] &&
+        buffer[offset + 13] === AUTH_CHUNKS[13] &&
+        buffer[offset + 14] === AUTH_CHUNKS[14] &&
+        buffer[offset + 15] === AUTH_CHUNKS[15];
 }
 
 function isCFError(err) {
     const msg = err?.message?.toLowerCase() || '';
-    return msg.includes('proxy request') || 
-           msg.includes('cannot connect') || 
-           msg.includes('cloudflare');
+    return msg.includes('proxy request') ||
+        msg.includes('cannot connect') ||
+        msg.includes('cloudflare');
 }
 
 
@@ -78,21 +80,24 @@ function mergeUint8Array(a, b) {
 
 // ============================================================================
 async function resolveHeader(streamReader) {
-    let buffer = new Uint8Array(4096); 
+    let buffer = new Uint8Array(4096);
     let offset = 0;
 
     const requireBytes = async (length) => {
         while (offset < length) {
-            const { value, done } = await streamReader.read();
+            const {
+                value,
+                done
+            } = await streamReader.read();
             if (done) return false;
-            
+
             if (offset + value.length > buffer.length) {
                 const newSize = Math.max(buffer.length * 2, offset + value.length);
                 const newBuffer = new Uint8Array(newSize);
                 newBuffer.set(buffer);
                 buffer = newBuffer;
             }
-            
+
             buffer.set(value, offset);
             offset += value.length;
         }
@@ -100,16 +105,22 @@ async function resolveHeader(streamReader) {
     };
 
     if (!(await requireBytes(18))) return null;
-    if (buffer[0] !== PROTO_VER) return { error: 'Err:V' };
-    if (!checkAuth(buffer, 1)) return { error: 'Err:A' };
+    if (buffer[0] !== PROTO_VER) return {
+        error: 'Err:V'
+    };
+    if (!checkAuth(buffer, 1)) return {
+        error: 'Err:A'
+    };
 
     const metaLen = buffer[17];
-    const addrTypeIdx = 18 + metaLen + 2; 
-    
+    const addrTypeIdx = 18 + metaLen + 2;
+
     if (!(await requireBytes(addrTypeIdx + 1))) return null;
 
     const action = buffer[18 + metaLen];
-    if (action !== TYPE_TCP && action !== TYPE_UDP) return { error: `Err:C-${action}` };
+    if (action !== TYPE_TCP && action !== TYPE_UDP) return {
+        error: `Err:C-${action}`
+    };
 
     const portIdx = 18 + metaLen + 1;
     const port = (buffer[portIdx] << 8) | buffer[portIdx + 1];
@@ -123,14 +134,14 @@ async function resolveHeader(streamReader) {
         payloadStart = addrStart + 4;
         if (!(await requireBytes(payloadStart))) return null;
         targetAddr = `${buffer[addrStart]}.${buffer[addrStart+1]}.${buffer[addrStart+2]}.${buffer[addrStart+3]}`;
-        
+
     } else if (addrType === ADDR_DNS) {
         if (!(await requireBytes(addrStart + 1))) return null;
         const dnsLen = buffer[addrStart];
         payloadStart = addrStart + 1 + dnsLen;
         if (!(await requireBytes(payloadStart))) return null;
         targetAddr = TEXT_DECODER.decode(buffer.subarray(addrStart + 1, payloadStart));
-        
+
     } else if (addrType === ADDR_V6) {
         payloadStart = addrStart + 16;
         if (!(await requireBytes(payloadStart))) return null;
@@ -140,18 +151,26 @@ async function resolveHeader(streamReader) {
         }
         targetAddr = `[${parts.join(':')}]`;
     } else {
-        return { error: `Err:T-${addrType}` };
+        return {
+            error: `Err:T-${addrType}`
+        };
     }
 
     const initialData = offset > payloadStart ? buffer.slice(payloadStart, offset) : new Uint8Array(0);
-    return { targetAddr, port, initialData, ver: buffer[0], action };
+    return {
+        targetAddr,
+        port,
+        initialData,
+        ver: buffer[0],
+        action
+    };
 }
 
 // ============================================================================
 export default {
     async fetch(request, env, ctx) {
         const _KEY = env.UUID || DEFAULT_UUID;
-        
+
         // 动态缓存 UUID 转换
         if (_KEY !== CACHED_UUID) {
             CACHED_UUID = _KEY;
@@ -160,38 +179,52 @@ export default {
                 AUTH_CHUNKS[i] = parseInt(cleanHex.substring(i * 2, i * 2 + 2), 16);
             }
         }
-        
+
         // 🚨 白天模式：伪装防护与订阅下发
         if (request.method === 'GET') {
             const url = new URL(request.url);
             if (url.pathname.includes(_KEY) || url.search.includes(_KEY)) {
-                return new Response(buildSchema(url, _KEY), { headers: { 'Content-Type': 'application/json' } });
+                return new Response(buildSchema(url, _KEY), {
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
             }
             // 伪造 Nginx 网页与 Server 响应头
-            return new Response(NGINX_HTML, { 
-                status: 200, 
-                headers: { 
+            return new Response(NGINX_HTML, {
+                status: 200,
+                headers: {
                     'Content-Type': 'text/html; charset=utf-8',
-                    'Server': 'nginx' 
-                } 
+                    'Server': 'nginx'
+                }
             });
         }
 
         // 🌃 黑夜模式：处理真实的代理请求 (POST 流量)
-        if (request.method !== 'POST') return new Response('Forbidden', { status: 403 });
+        if (request.method !== 'POST') return new Response('Forbidden', {
+            status: 403
+        });
 
         const ingressReader = request.body.getReader();
-        
+
         try {
             const headerInfo = await resolveHeader(ingressReader);
-            
+
             if (!headerInfo) {
-                try { ingressReader.releaseLock(); } catch {}
-                return new Response('Short Frame', { status: 400 });
+                try {
+                    ingressReader.releaseLock();
+                } catch {}
+                return new Response('Short Frame', {
+                    status: 400
+                });
             }
             if (headerInfo.error) {
-                try { ingressReader.releaseLock(); } catch {}
-                return new Response(headerInfo.error, { status: 400 });
+                try {
+                    ingressReader.releaseLock();
+                } catch {}
+                return new Response(headerInfo.error, {
+                    status: 400
+                });
             }
 
             // ==========================================================
@@ -199,11 +232,18 @@ export default {
             // ==========================================================
             if (headerInfo.action === TYPE_UDP) {
                 if (headerInfo.port !== 53) {
-                    try { ingressReader.releaseLock(); } catch {}
-                    return new Response('UDP not supported', { status: 403 });
+                    try {
+                        ingressReader.releaseLock();
+                    } catch {}
+                    return new Response('UDP not supported', {
+                        status: 403
+                    });
                 }
 
-                const { readable: outputStream, writable: internalLink } = new TransformStream();
+                const {
+                    readable: outputStream,
+                    writable: internalLink
+                } = new TransformStream();
                 const feedbackWriter = internalLink.getWriter();
                 await feedbackWriter.write(new Uint8Array([headerInfo.ver, 0]));
 
@@ -219,7 +259,7 @@ export default {
                                 udpBuffer = udpBuffer.slice(2 + dnsPayloadLen);
                                 handleDnsQuery(dnsQuery); // 异步触发 DoH
                             } else {
-                                break; 
+                                break;
                             }
                         }
                     };
@@ -228,7 +268,9 @@ export default {
                         try {
                             const resp = await fetch('https://1.1.1.1/dns-query', {
                                 method: 'POST',
-                                headers: { 'content-type': 'application/dns-message' },
+                                headers: {
+                                    'content-type': 'application/dns-message'
+                                },
                                 body: queryPayload
                             });
                             if (!resp.ok) return;
@@ -246,19 +288,26 @@ export default {
                             await processUdpChunk(headerInfo.initialData);
                         }
                         while (true) {
-                            const { done, value } = await ingressReader.read();
+                            const {
+                                done,
+                                value
+                            } = await ingressReader.read();
                             if (done) break;
                             await processUdpChunk(value);
                         }
-                    } catch (e) {
-                    } finally {
-                        try { feedbackWriter.close(); } catch {}
+                    } catch (e) {} finally {
+                        try {
+                            feedbackWriter.close();
+                        } catch {}
                     }
                 })());
 
                 return new Response(outputStream, {
                     status: 200,
-                    headers: { 'Connection': 'keep-alive', 'Content-Type': 'application/octet-stream' }
+                    headers: {
+                        'Connection': 'keep-alive',
+                        'Content-Type': 'application/octet-stream'
+                    }
                 });
             }
 
@@ -274,92 +323,143 @@ export default {
             for (let i = 0; i < attempts.length; i++) {
                 try {
                     const connectHost = attempts[i] || headerInfo.targetAddr;
-                    egressSocket = connect({ hostname: connectHost, port: headerInfo.port });
+                    egressSocket = connect({
+                        hostname: connectHost,
+                        port: headerInfo.port
+                    });
                     await egressSocket.opened;
                     connectionSuccess = true;
-                    break; 
+                    break;
                 } catch (err) {
-                    try { egressSocket?.close(); } catch {}
+                    try {
+                        egressSocket?.close();
+                    } catch {}
                     if (!isCFError(err) || i === attempts.length - 1) {
-                        try { ingressReader.releaseLock(); } catch {}
-                        return new Response(`Connection Failed`, { status: 502 });
+                        try {
+                            ingressReader.releaseLock();
+                        } catch {}
+                        return new Response(`Connection Failed`, {
+                            status: 502
+                        });
                     }
                 }
             }
 
             if (!connectionSuccess) {
-                try { ingressReader.releaseLock(); } catch {}
-                return new Response('Failed', { status: 502 });
+                try {
+                    ingressReader.releaseLock();
+                } catch {}
+                return new Response('Failed', {
+                    status: 502
+                });
             }
 
-            // --- ⬆️ 上行：稳健背压感知异步泵 (含防丢尾与 ready 控制) ---
+            ===
+            === === === === === === === === === === === === === === === === === === =
+
+            // 🚀 终极版上行流量中继 (零拷贝 + 强力防断流)
+
+            // ==========================================================
+
             const egressWriter = egressSocket.writable.getWriter();
+
+
+
             ctx.waitUntil((async () => {
+
                 try {
-                    let lastWritePromise = null;
+
+                    // 1. 发送解析头部时多读出来的首帧数据
 
                     if (headerInfo.initialData.length > 0) {
-                        lastWritePromise = egressWriter.write(headerInfo.initialData).catch(() => {});
+
+                        await egressWriter.write(headerInfo.initialData);
+
                     }
-                    
-                    while (true) {
-                        const { done, value } = await ingressReader.read();
-                        if (done) break;
-                        
-                        // 优雅的控速挂起：只有底层通道准备就绪才继续
-                        await egressWriter.ready;
-                        
-                        // 异步写入，并必须记录下最后一个 Promise！
-                        lastWritePromise = egressWriter.write(value).catch(() => {}); 
-                    }
-                    
-                    // 🛡️ 防丢尾保护：死等最后一块数据安全送达网络栈
-                    if (lastWritePromise) {
-                        await lastWritePromise;
-                    }
+
+
+
+                    // 2. 【核心动作】：彻底交出 JS 引擎对这两个流的控制权
+
+                    egressWriter.releaseLock();
+
+                    ingressReader.releaseLock();
+
+
+
+                    // 3. 【底层黑科技】：使用原生 C++ 管道拼接
+
+                    // preventClose: true -> 绝对不能省略！防止客户端结束请求时连累 Socket 被关
+
+                    // preventAbort: true -> 防止客户端意外断开时导致整体崩溃
+
+                    await request.body.pipeTo(egressSocket.writable, {
+
+                        preventClose: true,
+
+                        preventAbort: true
+
+                    });
+
+
 
                 } catch (e) {
-                    // 忽略正常网络断开
-                } finally {
-                    try { ingressReader.cancel().catch(() => {}); } catch {}
-                    try { egressWriter.releaseLock(); } catch {}
-                    try { egressSocket.close(); } catch {}
-                }
-            })());
 
-            // --- ⬇️ 下行：完美的 C++ 原生零拷贝 (防连坐崩溃) ---
+                    // 忽略网络断开引起的底层报错
+
+                }
+
+            })()); //
+
+            // ==========================================================
+            // 🔵 下行流量 (Server -> Client) : 完美的 C++ 原生零拷贝
+            // ==========================================================
             const feedbackHead = new Uint8Array([headerInfo.ver, 0]);
-            const { readable: outputStream, writable: internalLink } = new TransformStream();
+            const {
+                readable: outputStream,
+                writable: internalLink
+            } = new TransformStream();
 
             ctx.waitUntil((async () => {
                 try {
                     const feedbackWriter = internalLink.getWriter();
+                    // 1. 优雅塞入 VLESS 响应头
                     await feedbackWriter.write(feedbackHead);
                     feedbackWriter.releaseLock(); // 极其重要：立马放锁！
-                    
-                    // 将远端 Socket 的读端，零拷贝管接给客户端的响应流
-                    // ✅ 保留 preventAbort 防底层暴力重置引发 500 崩溃
-                    // ❌ 绝不能加 preventClose，否则无限转圈
-                    await egressSocket.readable.pipeTo(internalLink, { 
-                        preventAbort: true 
-                    }); 
+
+                    // 2. 将远端 Socket 的读端，零拷贝管接给客户端的响应流
+                    // 加上双 prevent 强力防断流/异常崩溃
+                    await egressSocket.readable.pipeTo(internalLink, {
+                        preventAbort: true,
+                        preventClose: true
+                    });
                 } catch (e) {
                     // 忽略断开错误
-                } 
+                } finally {
+                    // 确保下行链路最终闭环释放
+                    try {
+                        internalLink.close();
+                    } catch {}
+                }
             })());
 
+            // 返回零拷贝的 outputStream，交给 Cloudflare 基础架构去跑
             return new Response(outputStream, {
                 status: 200,
-                headers: { 
-                    'Connection': 'keep-alive', 
-                    'Content-Type': 'application/octet-stream', 
-                    'X-Relay-Status': 'Active' 
+                headers: {
+                    'Connection': 'keep-alive',
+                    'Content-Type': 'application/octet-stream',
+                    'X-Relay-Status': 'Active'
                 }
             });
 
         } catch (err) {
-            try { ingressReader.releaseLock(); } catch {}
-            return new Response('Internal Pipeline Error', { status: 500 });
+            try {
+                ingressReader.releaseLock();
+            } catch {}
+            return new Response('Internal Pipeline Error', {
+                status: 500
+            });
         }
     }
 };
@@ -371,15 +471,32 @@ function buildSchema(url, key) {
     const sPath = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
     return JSON.stringify({
         "service": "Data-Forwarder",
-        "engine": { "level": "stable" },
-        "in": [{ "port": 1080, "type": "bridge" }],
+        "engine": {
+            "level": "stable"
+        },
+        "in": [{
+            "port": 1080,
+            "type": "bridge"
+        }],
         "out": [{
             "type": "tunnel",
-            "params": { "endpoint": sHost, "port": 443, "auth": [{ "token": key }] },
+            "params": {
+                "endpoint": sHost,
+                "port": 443,
+                "auth": [{
+                    "token": key
+                }]
+            },
             "transport": {
                 "proto": "xhttp",
-                "options": { "mode": "stream", "host": sHost, "path": sPath },
-                "tls": { "sni": sHost }
+                "options": {
+                    "mode": "stream",
+                    "host": sHost,
+                    "path": sPath
+                },
+                "tls": {
+                    "sni": sHost
+                }
             }
         }]
     }, null, 2);
