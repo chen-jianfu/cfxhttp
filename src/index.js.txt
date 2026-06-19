@@ -284,28 +284,22 @@ export default {
                 sock,
                 init
             ) {
-
                 if (init.length) {
-
                     const w = sock.writable.getWriter();
-
                     try {
-
                         await w.write(init);
-
                     } finally {
-
                         w.releaseLock();
-
                     }
-
                 }
 
-
                 return req.body.pipeTo(
-                    sock.writable
-                );
+                    sock.writable,
 
+                    {
+                        preventAbort: true
+                    }
+                );
             }
 
 
@@ -314,98 +308,62 @@ export default {
                 sock,
                 link
             ) {
-
                 const w = link.getWriter();
-
                 try {
-
                     await w.write(
                         feedbackHead
                     );
-
                 } finally {
-
                     w.releaseLock();
-
                 }
 
-
                 return sock.readable.pipeTo(
-                    link
+                    link,
+
+                    {
+                        preventAbort: true
+                    }
                 );
 
             }
-
-
 
             try {
                 ingressReader.releaseLock();
             } catch {}
 
-
-
-            ctx.waitUntil((async () => {
-
-
-                const up = relayUpstream(
-
-                    request,
-                    egressSocket,
-                    headerInfo.initialData
-                );
-
-
-                const dn = relayDownstream(
-
-                    egressSocket,
-                    internalLink
-                );
-
-
-
-                await Promise.allSettled([
-
-                    up,
-                    dn,
-                    egressSocket.closed
-
-                ]);
-
-
+            relayUpstream(
+                request,
+                egressSocket,
+                headerInfo.initialData
+            ).catch(() => {
 
                 try {
-
                     egressSocket.close();
-
                 } catch {}
 
+            });
 
 
-            })());
+            relayDownstream(
+                egressSocket,
+                internalLink
+            ).catch(() => {
 
+                try {
+                    egressSocket.close();
+                } catch {}
+
+            });
 
 
             return new Response(
-
-                outputStream,
-
-                {
-
+                outputStream, {
                     status: 200,
-
                     headers: {
-
-                        'Content-Type': 'application/octet-stream',
-
-                        'Connection': 'keep-alive'
-
+                        "Content-Type": "application/octet-stream"
                     }
-
                 }
-
             );
-
-
         } catch (err) {
             try {
                 ingressReader.releaseLock();
