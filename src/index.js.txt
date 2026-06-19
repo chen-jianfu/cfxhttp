@@ -297,7 +297,8 @@ export default {
                     sock.writable,
 
                     {
-                        preventAbort: true
+                        preventAbort: true,
+                        preventClose: true
                     }
                 );
             }
