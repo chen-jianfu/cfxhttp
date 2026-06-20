@@ -75,11 +75,10 @@ function mergeUint8Array(a, b) {
 }
 
 
-// ============================================================================
+
 async function resolveHeader(streamReader) {
     let buffer = new Uint8Array(4096);
     let offset = 0;
-
     const requireBytes = async (length) => {
         while (offset < length) {
             const {
@@ -87,11 +86,18 @@ async function resolveHeader(streamReader) {
                 done
             } = await streamReader.read();
             if (done) return false;
+            if (offset + value.length > buffer.length) {
+                const newSize = Math.max(buffer.length * 2, offset + value.length);
+                const newBuffer = new Uint8Array(newSize);
+                newBuffer.set(buffer);
+                buffer = newBuffer;
+            }
             buffer.set(value, offset);
             offset += value.length;
         }
         return true;
     };
+
 
     if (!(await requireBytes(18))) return null;
     if (buffer[0] !== PROTO_VER) return {
@@ -231,29 +237,56 @@ export default {
             ];
 
 
-            // 智能节点回退与阻断探测
+            function connectTimeout(ms) {
+                return new Promise((_, reject) => {
+                    setTimeout(() => {
+                        reject(new Error("Connection timeout"));
+                    }, ms);
+                });
+            }
+
             for (let i = 0; i < targets.length; i++) {
+
                 try {
-                    const connectHost = targets[i];
+
                     egressSocket = connect({
-                        hostname: connectHost,
+                        hostname: targets[i],
                         port: headerInfo.port
                     });
-                    await egressSocket.opened;
+
+                    await Promise.race([
+                        egressSocket.opened,
+                        connectTimeout(5000)
+                    ]);
+
                     connectionSuccess = true;
                     break;
+
                 } catch (err) {
+
                     try {
                         egressSocket?.close();
                     } catch {}
-                    if (!isCFError(err) || i === targets.length - 1) {
-                        try {
-                            ingressReader.releaseLock();
-                        } catch {}
-                        return new Response(`Connection Failed`, {
-                            status: 502
-                        });
+
+                    const isTimeout =
+                        err?.message === 'Connection timeout';
+
+                    if (
+                        (isTimeout || isCFError(err)) &&
+                        i < targets.length - 1
+                    ) {
+                        continue;
                     }
+
+                    try {
+                        ingressReader.releaseLock();
+                    } catch {}
+
+                    return new Response(
+                        'Connection Failed', {
+                            status: 502
+                        }
+                    );
                 }
             }
 
@@ -294,16 +327,12 @@ export default {
                 }
 
                 return req.body.pipeTo(
-                    sock.writable,
-
-                    {
+                    sock.writable, {
                         preventAbort: true,
                         preventClose: true
                     }
                 );
             }
-
-
 
             async function relayDownstream(
                 sock,
@@ -365,6 +394,8 @@ export default {
                     }
                 }
             );
+
+
         } catch (err) {
             try {
                 ingressReader.releaseLock();
