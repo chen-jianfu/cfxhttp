@@ -3,14 +3,28 @@ const CFG = {
     chunk: 64 * 1024,
     dnPack: 32 * 1024,
     dnTail: 512,
-    dnMs: 0,
-    upPack: 16 * 1024,
-    upQMax: 256 * 1024,
+    dnQr: 4,
+    upPack: 20 * 1024,
     maxED: 8 * 1024,
     concur: 4
 };
 let fbAddr = '';
-const parseAddrPort = s => { const i=s.lastIndexOf(':'); if(i>0){const a=s.slice(0,i),p=parseInt(s.slice(i+1)); if(!a.includes(':')&&p>0&&p<65536) return {a,p};} return {a:s,p:null}; };
+const parseAddrPort = s => {
+    const i = s.lastIndexOf(':');
+    if (i > 0) {
+        const a = s.slice(0, i),
+        p = parseInt(s.slice(i + 1));
+        if (!a.includes(':') && p > 0 && p < 65536)
+            return {
+                a,
+                p
+            };
+    }
+    return {
+        a: s,
+        p: null
+    };
+};
 export default {
     fetch: req => req.headers.get('Upgrade')?.toLowerCase() === 'websocket' ? ws(req) : new Response('Hello world!')
 };
@@ -53,7 +67,7 @@ const parseAddr = (b, o, t) => {
         dataOffset: n
     };
 };
-const vless = c => {
+const relay = c => {
     if (c.length < 24 || !matchID(c))
         return null;
     let o = 19 + c[17];
@@ -69,125 +83,122 @@ const vless = c => {
     }
      : null;
 };
-const mkQ = (cap, qCap = cap, itemsMax = Math.max(1, qCap >> 8)) => {
+const mkK = (cap, cpy = 0) => {
     let q = [],
     h = 0,
-    qB = 0,
+    b = 0,
     buf = null;
-    const trim = () => {
+    const e = () => h >= q.length,
+    trim = () => {
         h > 32 && h * 2 >= q.length && (q = q.slice(h), h = 0);
+    },
+    clear = () => {
+        q = [];
+        h = 0;
+        b = 0;
     };
     const take = () => {
-        if (h >= q.length)
+        if (e())
             return null;
         const d = q[h];
         q[h++] = undefined;
-        qB -= d.byteLength;
+        b -= d.byteLength;
         trim();
         return d;
     };
-    return {
-        get bytes() {
-            return qB;
-        },
-        get size() {
-            return q.length - h;
-        },
-        get empty() {
-            return h >= q.length;
-        },
-        clear() {
-            q = [];
-            h = 0;
-            qB = 0;
-        },
-        sow(d) {
-            const n = d?.byteLength || 0;
-            if (!n)
-                return 1;
-            if (qB + n > qCap || q.length - h >= itemsMax)
-                return 0;
-            q.push(d);
-            qB += n;
-            return 1;
-        },
-        bundle(d) {
-            d ||= take();
-            if (!d || h >= q.length || d.byteLength >= cap)
-                return [d, 0];
-            let n = d.byteLength,
-            e = h;
-            while (e < q.length) {
-                const x = q[e],
-                nn = n + x.byteLength;
-                if (nn > cap)
-                    break;
-                n = nn;
-                e++;
-            }
-            if (e === h)
-                return [d, 0];
-            const out = buf ||= new Uint8Array(cap);
-            out.set(d);
-            for (let o = d.byteLength; h < e; ) {
-                const x = q[h];
-                q[h++] = undefined;
-                qB -= x.byteLength;
-                out.set(x, o);
-                o += x.byteLength;
-            }
-            trim();
-            return [out.subarray(0, n), 1];
+    const sow = d => {
+        const n = d?.byteLength || 0;
+        return !n || (q.push(d), b += n, 1);
+    };
+    const pack = d => {
+        d ||= take();
+        if (!d || e())
+            return [d, 0];
+        let n = d.byteLength,
+        j = h;
+        while (j < q.length) {
+            const x = q[j],
+            nn = n + x.byteLength;
+            if (nn > cap)
+                break;
+            n = nn;
+            j++;
         }
+        if (j === h)
+            return [d, 0];
+        const out = buf ||= new Uint8Array(cap);
+        out.set(d);
+        for (let o = d.byteLength; h < j; ) {
+            const x = q[h];
+            q[h++] = undefined;
+            b -= x.byteLength;
+            out.set(x, o);
+            o += x.byteLength;
+        }
+        trim();
+        const u = out.subarray(0, n);
+        return [cpy ? u.slice() : u, 1];
+    };
+    return {
+        e,
+        get b() {
+            return b;
+        },
+        clear,
+        take,
+        sow,
+        pack
+    };
+};
+const mkQ = cap => {
+    const k = mkK(cap);
+    return {
+        get empty() {
+            return k.e();
+        },
+        clear: k.clear,
+        sow: k.sow,
+        bundle: d => k.pack(d)
     };
 };
 const mkDn = w => {
     const cap = CFG.dnPack,
     tail = CFG.dnTail,
-    low = Math.max(4096, tail << 3);
-    let pb = new Uint8Array(cap),
-    p = 0,
-    tp = 0,
-    mq = 0,
+    low = Math.max(4096, tail * 12),
+    k = mkK(cap, 1);
+    let tp = 0,
     gen = 0,
     qk = 0,
     qr = 0;
     const reap = () => {
         tp && clearTimeout(tp);
         tp = 0;
-        mq = 0;
-        if (!p)
-            return;
-        w.send(pb.subarray(0, p).slice());
-        pb = new Uint8Array(cap);
-        p = 0;
         qr = 0;
+        for (; ; ) {
+            const [u] = k.pack();
+            if (!u)
+                break;
+            w.send(u);
+        }
     };
     const ripen = () => {
-        if (tp || mq)
+        if (k.e() || tp)
             return;
-        mq = 1;
-        qk = gen;
-        queueMicrotask(() => {
-            mq = 0;
-            if (!p || tp)
+        if (k.b >= cap || cap - k.b < tail)
+            return reap();
+        tp = setTimeout(() => {
+            tp = 0;
+            if (k.e())
                 return;
-            if (cap - p < tail)
+            if (k.b >= cap || cap - k.b < tail)
                 return reap();
-            tp = setTimeout(() => {
-                tp = 0;
-                if (!p)
-                    return;
-                if (cap - p < tail)
-                    return reap();
-                if (qr < 2 && (gen !== qk || p < low)) {
-                    qr++;
-                    qk = gen;
-                    return ripen();
-                }
-                reap();
-            }, Math.max(CFG.dnMs, 1));
-        });
+            if (qr < CFG.dnQr && (gen !== qk || k.b < low)) {
+                qr++;
+                qk = gen;
+                return ripen();
+            }
+            reap();
+        }, 1);
     };
     return {
         send(u) {
@@ -196,18 +207,15 @@ const mkDn = w => {
             if (!n)
                 return;
             while (o < n) {
-                if (!p && n - o >= cap) {
-                    const m = Math.min(cap, n - o);
-                    w.send(o || m !== n ? u.subarray(o, o + m) : u);
-                    o += m;
+                const m = Math.min(cap - k.b, n - o);
+                if (!m) {
+                    reap();
                     continue;
                 }
-                const m = Math.min(cap - p, n - o);
-                pb.set(u.subarray(o, o + m), p);
-                p += m;
-                o += m;
+                k.sow(o || m !== n ? u.subarray(o, o + m) : u);
                 gen++;
-                if (p === cap || cap - p < tail)
+                o += m;
+                if (k.b >= cap || cap - k.b < tail)
                     reap();
                 else
                     ripen();
@@ -265,7 +273,7 @@ const ws = async req => {
     sock = null,
     closed = false,
     busy = false;
-    const uq = mkQ(CFG.upPack, CFG.upQMax, CFG.upQMax >> 8);
+    const uq = mkQ(CFG.upPack);
     const wither = () => {
         if (closed)
             return;
@@ -304,7 +312,7 @@ const ws = async req => {
                     const [d] = uq.bundle();
                     if (!d)
                         break;
-                    const r = vless(d);
+                    const r = relay(d);
                     if (!r)
                         throw wither();
                     server.send(new Uint8Array([d[0], 0]));
@@ -314,7 +322,8 @@ const ws = async req => {
                     try {
                         sock = await raceSprout(fetcher, host, port);
                     } catch (_) {
-                        if (!fbAddr) throw _;
+                        if (!fbAddr)
+                            throw _;
                         const fb = parseAddrPort(fbAddr);
                         sock = await raceSprout(fetcher, fb.a, fb.p || port);
                     }
@@ -336,7 +345,7 @@ const ws = async req => {
         }
         finally {
             busy = false;
-            !uq.empty && !closed && queueMicrotask(thresh);
+            !uq.empty && !closed && thresh();
         }
     };
     if (ed && sow(ed))
