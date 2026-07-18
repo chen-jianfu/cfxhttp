@@ -40,7 +40,7 @@ Commercial support is available at
 
 const TEXT_DECODER = new TextDecoder();
 const CONNECT_TIMEOUT_MS = 3000;
-const MAX_CONCURRENT = 96;
+const MAX_CONCURRENT = 64;
 let ACTIVE_CONNECTIONS = 0;
 let I0, I1, I2, I3, I4, I5, I6, I7, I8, I9, I10, I11, I12, I13, I14, I15;
 let CACHED_UUID = '';
@@ -360,12 +360,16 @@ export default {
                 internalLink
             );
 
-            ctx.waitUntil(
-                Promise.allSettled([upstreamPromise, downstreamPromise, egressSocket.closed])
-                    .finally(() => {
-                        ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
-                    })
-            );
+            upstreamPromise.catch(() => {}).then(() => {
+                try { egressSocket.close(); } catch {}
+            });
+            downstreamPromise.catch(() => {}).then(() => {
+                try { egressSocket.close(); } catch {}
+            });
+
+            Promise.allSettled([upstreamPromise, downstreamPromise]).finally(() => {
+                ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
+            });
 
             return new Response(outputStream, {
                 status: 200,
