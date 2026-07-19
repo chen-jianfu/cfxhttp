@@ -187,7 +187,6 @@ export default {
 
         ACTIVE_CONNECTIONS++;
         let ingressReader;
-        let asyncCleanup = false;
 
         try {
             ingressReader = request.body.getReader({ mode: 'byob' });
@@ -302,11 +301,7 @@ export default {
                 }),
             ]).finally(() => {
                 try { egressSocket.close(); } catch {}
-                ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
             });
-
-            ctx.waitUntil(cleanupPromise);
-            asyncCleanup = true;
 
             return new Response(outputStream, {
                 status: 200,
@@ -324,9 +319,7 @@ export default {
                 status: 500
             });
         } finally {
-            if (!asyncCleanup) {
-                ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
-            }
+            ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
         }
     }
 };
