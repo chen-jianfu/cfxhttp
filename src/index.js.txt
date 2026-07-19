@@ -70,18 +70,11 @@ function isCFError(err) {
 }
 
 
-function concatBuffers(a, b) {
-    const res = new Uint8Array(a.length + b.length);
-    res.set(a);
-    res.set(b, a.length);
-    return res;
-}
-
 async function readAtLeast(reader, minLen, rlen, cache) {
     if (rlen >= minLen) return { cache, rlen, done: false };
     const r = await reader.readAtLeast(minLen - rlen, new Uint8Array(65536));
-    const newCache = concatBuffers(cache, r.value);
-    return { cache: newCache, rlen: newCache.length, done: r.done };
+    cache.set(r.value, rlen);
+    return { cache, rlen: rlen + r.value.length, done: r.done };
 }
 
 async function resolveHeader(reader) {
@@ -147,7 +140,7 @@ async function resolveHeader(reader) {
         for (let i = 0; i < 16; i += 2) {
             parts.push(((cache[addrStart + i] << 8) | cache[addrStart + i + 1]).toString(16));
         }
-        targetAddr = `[${parts.join(':')}]`;
+        targetAddr = parts.join(':');
     } else {
         return { error: `Err:T-${addrType}` };
     }
@@ -184,47 +177,38 @@ export default {
             status: 403
         });
 
+        if (!request.body) {
+            return new Response('Missing request body', { status: 400 });
+        }
+
         if (ACTIVE_CONNECTIONS >= MAX_CONCURRENT) {
             return new Response('Too many connections', { status: 429 });
         }
-        ACTIVE_CONNECTIONS++;
 
-        const ingressReader = request.body.getReader({ mode: 'byob' });
+        ACTIVE_CONNECTIONS++;
+        let ingressReader;
+        let asyncCleanup = false;
 
         try {
+            ingressReader = request.body.getReader({ mode: 'byob' });
+
             const headerInfo = await resolveHeader(ingressReader);
 
             if (!headerInfo) {
-                try {
-                    ingressReader.releaseLock();
-                } catch {}
-                ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
-                return new Response('Short Frame', {
-                    status: 400
-                });
+                try { ingressReader.releaseLock(); } catch {}
+                return new Response('Short Frame', { status: 400 });
             }
             if (headerInfo.error) {
-                try {
-                    ingressReader.releaseLock();
-                } catch {}
-                ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
-                return new Response(headerInfo.error, {
-                    status: 400
-                });
+                try { ingressReader.releaseLock(); } catch {}
+                return new Response(headerInfo.error, { status: 400 });
             }
 
             // ==========================================================
             // ?? 分支 A：UDP 流量 
             // ==========================================================
             if (headerInfo.action === TYPE_UDP) {
-
-                try {
-                    ingressReader.releaseLock();
-                } catch {}
-                ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
-                return new Response('UDP not supported', {
-                    status: 403
-                });
+                try { ingressReader.releaseLock(); } catch {}
+                return new Response('UDP not supported', { status: 403 });
             }
 
             // ==========================================================
@@ -237,10 +221,16 @@ export default {
                 ? [fallbackIP]
                 : [headerInfo.targetAddr, fallbackIP];
 
-            function connectTimeout(ms) {
-                return new Promise((_, reject) => {
-                    setTimeout(() => reject(new Error('Connection timeout')), ms);
+            async function withTimeout(promise, ms) {
+                let timerId;
+                const timeoutPromise = new Promise((_, reject) => {
+                    timerId = setTimeout(() => reject(new Error('Connection timeout')), ms);
                 });
+                try {
+                    return await Promise.race([promise, timeoutPromise]);
+                } finally {
+                    clearTimeout(timerId);
+                }
             }
 
             for (let i = 0; i < targets.length; i++) {
@@ -248,45 +238,20 @@ export default {
                     egressSocket = connect({
                         hostname: targets[i],
                         port: headerInfo.port
-                    });
-
-                    await Promise.race([
-                        egressSocket.opened,
-                        connectTimeout(CONNECT_TIMEOUT_MS)
-                    ]);
-
+                    }, { allowHalfOpen: true });
+                    await withTimeout(egressSocket.opened, CONNECT_TIMEOUT_MS);
                     connectionSuccess = true;
                     break;
                 } catch (err) {
-                    try {
-                        egressSocket?.close();
-                    } catch {}
-
+                    try { egressSocket?.close(); } catch {}
                     const isTimeout = err?.message === 'Connection timeout';
-
-                    if (
-                        (isTimeout || isCFError(err)) &&
-                        i < targets.length - 1
-                    ) {
+                    if ((isTimeout || isCFError(err)) && i < targets.length - 1) {
                         continue;
                     }
-
-                    try {
-                        ingressReader.releaseLock();
-                    } catch {}
-                    ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
+                    try { ingressReader.releaseLock(); } catch {}
                     return new Response('Connection Failed', { status: 502 });
                 }
             }
-
-            if (!connectionSuccess) {
-                try {
-                    ingressReader.releaseLock();
-                } catch {}
-                ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
-                return new Response('Failed', { status: 502 });
-            }
-
 
             const feedbackHead = new Uint8Array([
                 headerInfo.ver,
@@ -298,13 +263,7 @@ export default {
                 writable: internalLink
             } = new TransformStream();
 
-
-
-            async function relayUpstream(
-                req,
-                sock,
-                init
-            ) {
+            async function relayUpstream(req, sock, init) {
                 if (init.length) {
                     const w = sock.writable.getWriter();
                     try {
@@ -313,63 +272,41 @@ export default {
                         w.releaseLock();
                     }
                 }
-
-                return req.body.pipeTo(
-                    sock.writable, {
-                        preventAbort: true,
-                        preventClose: true
-                    }
-                );
+                return req.body.pipeTo(sock.writable, {
+                    preventAbort: false,
+                    preventClose: false
+                });
             }
 
-            async function relayDownstream(
-                sock,
-                link
-            ) {
+            async function relayDownstream(sock, link) {
                 const w = link.getWriter();
                 try {
-                    await w.write(
-                        feedbackHead
-                    );
+                    await w.write(feedbackHead);
                 } finally {
                     w.releaseLock();
                 }
-
-                return sock.readable.pipeTo(
-                    link,
-
-                    {
-                        preventAbort: true
-                    }
-                );
-
+                return sock.readable.pipeTo(link, { preventAbort: false });
             }
 
-            try {
-                ingressReader.releaseLock();
-            } catch {}
+            try { ingressReader.releaseLock(); } catch {}
 
-            const upstreamPromise = relayUpstream(
-                request,
-                egressSocket,
-                headerInfo.initialData
-            );
+            const upstreamPromise = relayUpstream(request, egressSocket, headerInfo.initialData);
+            const downstreamPromise = relayDownstream(egressSocket, internalLink);
 
-            const downstreamPromise = relayDownstream(
-                egressSocket,
-                internalLink
-            );
-
-            upstreamPromise.catch(() => {}).then(() => {
+            const cleanupPromise = Promise.allSettled([
+                upstreamPromise.catch((err) => {
+                    try { egressSocket.close(); } catch {}
+                }),
+                downstreamPromise.catch((err) => {
+                    try { egressSocket.close(); } catch {}
+                }),
+            ]).finally(() => {
                 try { egressSocket.close(); } catch {}
-            });
-            downstreamPromise.catch(() => {}).then(() => {
-                try { egressSocket.close(); } catch {}
-            });
-
-            Promise.allSettled([upstreamPromise, downstreamPromise]).finally(() => {
                 ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
             });
+
+            ctx.waitUntil(cleanupPromise);
+            asyncCleanup = true;
 
             return new Response(outputStream, {
                 status: 200,
@@ -382,13 +319,14 @@ export default {
             });
 
         } catch (err) {
-            try {
-                ingressReader.releaseLock();
-            } catch {}
-            ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
+            try { ingressReader?.releaseLock(); } catch {}
             return new Response('Internal Pipeline Error', {
                 status: 500
             });
+        } finally {
+            if (!asyncCleanup) {
+                ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
+            }
         }
     }
 };
