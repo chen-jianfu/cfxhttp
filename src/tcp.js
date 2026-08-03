@@ -325,7 +325,7 @@ const ws = async req => {
                         if (!fbAddr)
                             throw _;
                         const fb = parseAddrPort(fbAddr);
-                        sock = await raceSprout(fetcher, fb.a, fb.p || port);
+                        sock = await sprout(fetcher, fb.a, fb.p || port);
                     }
                     if (!sock)
                         throw wither();
