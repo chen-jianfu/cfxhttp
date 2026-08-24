@@ -1,485 +1,660 @@
-// XHTTP Worker - 可直接部署到 Cloudflare Workers
-// 版本: 1.1.0
+import { connect } from 'cloudflare:sockets'
 
-import { connect } from 'cloudflare:sockets';
+// configurations
+const UUID = '96c50e3a-5b87-49dd-bd20-03c7f2735e40' // vless UUID
+const PROXY = 'ProxyIP.US.CMLiussss.net' // (optional) reverse proxy for CF websites. e.g. example.com
+const LOG_LEVEL = 'none' // debug, info, error, none
 
-// ============ 默认配置（可通过环境变量覆盖）============
-const DEFAULT_CONFIG = {
-  uuid: '96c50e3a-5b87-49dd-bd20-03c7f2735e40',
-  fallbackAddress: 'ProxyIP.US.CMLiussss.net',
-  maxConcurrent: 32,
-  bufferSize: 128 * 1024,
-  connectTimeoutMs: 5000,
-  idleTimeoutMs: 45000,
-  maxRetries: 2
-};
+// source code
+const TIME_ZONE = 8 * 60 * 60 * 1000 // logging timestamp forwards 8 hours
+const BUFFER_SIZE = 64 * 1024 // read/write buffer size in bytes
+const UPLOAD_PACK_SIZE = 20 * 1024 // upload batching target size (borrowed from _worker.js)
 
-let CONFIG = { ...DEFAULT_CONFIG };
-let ACTIVE_CONNECTIONS = 0;
-
-// ============ 地址类型常量 ============
-const ADDRESS_TYPE_IPV4 = 1;
-const ADDRESS_TYPE_URL = 2;
-const ADDRESS_TYPE_IPV6 = 3;
-
-// ============ 工具函数 ============
-
-function xhttp_sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function validate_uuid_xhttp(id, uuid) {
-  for (let index = 0; index < 16; index++) {
-    if (id[index] !== uuid[index]) {
-      return false;
+function to_size(size) {
+    const KiB = 1024
+    const min = 1.1 * KiB
+    let i = 0
+    const SIZE_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+    for (; i < SIZE_UNITS.length; i++) {
+        if (size < min) {
+            break
+        }
+        size = size / KiB
     }
-  }
-  return true;
+    return `${Math.floor(size)} ${SIZE_UNITS[i]}`
 }
 
-class XhttpCounter {
-  #total
+// Unrolled 16-byte comparison, borrowed from GrainTCP `matchID`.
+// Eliminates the per-byte loop overhead in hot paths.
+function validate_uuid(id, u) {
+    return (
+        id[0] === u[0] &&
+        id[1] === u[1] &&
+        id[2] === u[2] &&
+        id[3] === u[3] &&
+        id[4] === u[4] &&
+        id[5] === u[5] &&
+        id[6] === u[6] &&
+        id[7] === u[7] &&
+        id[8] === u[8] &&
+        id[9] === u[9] &&
+        id[10] === u[10] &&
+        id[11] === u[11] &&
+        id[12] === u[12] &&
+        id[13] === u[13] &&
+        id[14] === u[14] &&
+        id[15] === u[15]
+    )
+}
 
-  constructor() {
-    this.#total = 0;
-  }
+class Counter {
+    #total
 
-  get() {
-    return this.#total;
-  }
+    constructor() {
+        this.#total = 0
+    }
 
-  add(size) {
-    this.#total += size;
-  }
+    get() {
+        return this.#total
+    }
+
+    add(size) {
+        this.#total += size
+    }
 }
 
 function concat_typed_arrays(first, ...args) {
-  let len = first.length;
-  for (let a of args) {
-    len += a.length;
-  }
-  const r = new first.constructor(len);
-  r.set(first, 0);
-  len = first.length;
-  for (let a of args) {
-    r.set(a, len);
-    len += a.length;
-  }
-  return r;
-}
-
-function parse_uuid_xhttp(uuid) {
-  uuid = uuid.replaceAll('-', '');
-  const r = [];
-  for (let index = 0; index < 16; index++) {
-    const v = parseInt(uuid.substr(index * 2, 2), 16);
-    r.push(v);
-  }
-  return r;
-}
-
-function get_xhttp_buffer(size) {
-  return new Uint8Array(new ArrayBuffer(size || CONFIG.bufferSize));
-}
-
-// ============ XHTTP 协议头解析 ============
-
-async function read_xhttp_header(readable, uuid_str) {
-  const reader = readable.getReader({ mode: 'byob' });
-
-  try {
-    let r = await reader.readAtLeast(1 + 16 + 1, get_xhttp_buffer());
-    let rlen = 0;
-    let idx = 0;
-    let cache = r.value;
-    rlen += r.value.length;
-
-    const version = cache[0];
-    const id = cache.slice(1, 1 + 16);
-    const uuid = parse_uuid_xhttp(uuid_str);
-    if (!validate_uuid_xhttp(id, uuid)) {
-      return `invalid UUID`;
+    let len = first.length
+    for (let a of args) {
+        len += a.length
     }
-    const pb_len = cache[1 + 16];
-    const addr_plus1 = 1 + 16 + 1 + pb_len + 1 + 2 + 1;
+    const r = new first.constructor(len)
+    r.set(first, 0)
+    len = first.length
+    for (let a of args) {
+        r.set(a, len)
+        len += a.length
+    }
+    return r
+}
+
+class Logger {
+    #id
+    #level
+
+    constructor(log_level) {
+        this.#id = random_id()
+
+        if (typeof log_level !== 'string') {
+            log_level = 'info'
+        }
+        const levels = ['debug', 'info', 'error', 'none']
+        this.#level = levels.indexOf(log_level.toLowerCase())
+    }
+
+    is_debug() {
+        return this.#level < 1
+    }
+
+    debug(...args) {
+        if (this.is_debug()) {
+            this.#log(`[debug]`, ...args)
+        }
+    }
+
+    info(...args) {
+        if (this.#level < 2) {
+            this.#log(`[info ]`, ...args)
+        }
+    }
+
+    error(...args) {
+        if (this.#level < 3) {
+            this.#log(`[error]`, ...args)
+        }
+    }
+
+    #log(prefix, ...args) {
+        const now = new Date(Date.now() + TIME_ZONE).toISOString()
+        console.log(now, prefix, `(${this.#id})`, ...args)
+    }
+}
+
+function random_id() {
+    const min = 10000
+    const max = min * 10 - 1
+    return Math.floor(Math.random() * (max - min + 1)) + min
+}
+
+function parse_uuid(uuid) {
+    uuid = uuid.replaceAll('-', '')
+    const r = []
+    for (let index = 0; index < 16; index++) {
+        const v = parseInt(uuid.substr(index * 2, 2), 16)
+        r.push(v)
+    }
+    return r
+}
+
+function get_buffer(size) {
+    return new Uint8Array(new ArrayBuffer(size || BUFFER_SIZE))
+}
+
+// enums
+const ADDRESS_TYPE_IPV4 = 1
+const ADDRESS_TYPE_URL = 2
+const ADDRESS_TYPE_IPV6 = 3
+
+async function read_vless_header(readable, uuid_str) {
+    const reader = readable.getReader({ mode: 'byob' })
+
+    let r = await reader.readAtLeast(1 + 16 + 1, get_buffer())
+    let rlen = 0
+    let idx = 0
+    let cache = r.value
+    rlen += r.value.length
+
+    const version = cache[0]
+    const id = cache.subarray(1, 1 + 16)
+    const uuid = parse_uuid(uuid_str)
+    if (!validate_uuid(id, uuid)) {
+        return `invalid UUID`
+    }
+    const pb_len = cache[1 + 16]
+    const addr_plus1 = 1 + 16 + 1 + pb_len + 1 + 2 + 1
 
     if (addr_plus1 + 1 > rlen) {
-      if (r.done) {
-        return `header too short`;
-      }
-      idx = addr_plus1 + 1 - rlen;
-      r = await reader.readAtLeast(idx, get_xhttp_buffer());
-      rlen += r.value.length;
-      cache = concat_typed_arrays(cache, r.value);
+        if (r.done) {
+            return `header too short`
+        }
+        idx = addr_plus1 + 1 - rlen
+        r = await reader.readAtLeast(idx, get_buffer())
+        rlen += r.value.length
+        cache = concat_typed_arrays(cache, r.value)
     }
 
-    const cmd = cache[1 + 16 + 1 + pb_len];
+    const cmd = cache[1 + 16 + 1 + pb_len]
     if (cmd !== 1) {
-      return `unsupported command: ${cmd}`;
+        return `unsupported command: ${cmd}`
     }
-    const port = (cache[addr_plus1 - 1 - 2] << 8) + cache[addr_plus1 - 1 - 1];
-    const atype = cache[addr_plus1 - 1];
-    let header_len = -1;
+    const port = (cache[addr_plus1 - 1 - 2] << 8) + cache[addr_plus1 - 1 - 1]
+    const atype = cache[addr_plus1 - 1]
+    let header_len = -1
     if (atype === ADDRESS_TYPE_IPV4) {
-      header_len = addr_plus1 + 4;
+        header_len = addr_plus1 + 4
     } else if (atype === ADDRESS_TYPE_IPV6) {
-      header_len = addr_plus1 + 16;
+        header_len = addr_plus1 + 16
     } else if (atype === ADDRESS_TYPE_URL) {
-      header_len = addr_plus1 + 1 + cache[addr_plus1];
+        header_len = addr_plus1 + 1 + cache[addr_plus1]
     }
 
     if (header_len < 0) {
-      return 'read address type failed';
+        return 'read address type failed'
     }
 
-    idx = header_len - rlen;
+    idx = header_len - rlen
     if (idx > 0) {
-      if (r.done) {
-        return `read address failed`;
-      }
-      r = await reader.readAtLeast(idx, get_xhttp_buffer());
-      rlen += r.value.length;
-      cache = concat_typed_arrays(cache, r.value);
+        if (r.done) {
+            return `read address failed`
+        }
+        r = await reader.readAtLeast(idx, get_buffer())
+        rlen += r.value.length
+        cache = concat_typed_arrays(cache, r.value)
     }
 
-    let hostname = '';
-    idx = addr_plus1;
+    let hostname = ''
+    idx = addr_plus1
     switch (atype) {
-      case ADDRESS_TYPE_IPV4:
-        hostname = cache.slice(idx, idx + 4).join('.');
-        break;
-      case ADDRESS_TYPE_URL:
-        hostname = new TextDecoder().decode(
-          cache.slice(idx + 1, idx + 1 + cache[idx]),
-        );
-        break;
-      case ADDRESS_TYPE_IPV6:
-        hostname = cache
-          .slice(idx, idx + 16)
-          .reduce(
-            (s, b2, i2, a) =>
-              i2 % 2
-                ? s.concat(((a[i2 - 1] << 8) + b2).toString(16))
-                : s,
-            [],
-          )
-          .join(':');
-        break;
+        case ADDRESS_TYPE_IPV4:
+            hostname = cache.subarray(idx, idx + 4).join('.')
+            break
+        case ADDRESS_TYPE_URL:
+            hostname = new TextDecoder().decode(
+                cache.subarray(idx + 1, idx + 1 + cache[idx]),
+            )
+            break
+        case ADDRESS_TYPE_IPV6:
+            hostname = cache
+                .subarray(idx, idx + 16)
+                .reduce(
+                    (s, b2, i2, a) =>
+                        i2 % 2
+                            ? s.concat(((a[i2 - 1] << 8) + b2).toString(16))
+                            : s,
+                    [],
+                )
+                .join(':')
+            break
     }
 
     if (hostname.length < 1) {
-      return 'failed to parse hostname';
+        return 'failed to parse hostname'
     }
 
-    const data = cache.slice(header_len);
+    // IMPORTANT: must use slice() (copy), NOT subarray() (view).
+    // `cache` may be a BYOB buffer that gets detached by subsequent
+    // reader.read() calls. A view would point to detached memory.
+    const data = cache.slice(header_len)
     return {
-      hostname,
-      port,
-      data,
-      resp: new Uint8Array([version, 0]),
-      reader,
-      done: r.done,
-    };
-  } catch (error) {
-    try { reader.releaseLock(); } catch (_) {}
-    throw error;
-  }
+        hostname,
+        port,
+        data,
+        resp: new Uint8Array([version, 0]),
+        reader,
+        done: r.done,
+    }
 }
 
-// ============ 上传器：客户端 -> 远程 ============
+// Upload batching packer, borrowed from _worker.js `创建上行Grain合包流`.
+// Batches small chunks into UPLOAD_PACK_SIZE (20KB) packets before
+// writing to the remote, reducing writer.write() invocations and
+// improving large file upload smoothness.
+function create_upload_packer(writer, log, target_size = UPLOAD_PACK_SIZE) {
+    const buf = new Uint8Array(target_size)
+    let buf_len = 0
+    let timer = null
+    let in_flight = null
+    let flush_chain = Promise.resolve()
+    let pack_count = 0
+    let direct_count = 0
+    let buffered_count = 0
 
-async function upload_to_remote_xhttp(counter, writer, httpx) {
-  async function inner_upload(d) {
-    if (!d || d.length === 0) {
-      return;
+    const clear_timer = () => {
+        if (timer) {
+            clearTimeout(timer)
+            timer = null
+        }
     }
-    counter.add(d.length);
+
+    const serial_write = async (chunk) => {
+        if (in_flight) await in_flight
+        in_flight = writer.write(chunk)
+        try { await in_flight } finally { in_flight = null }
+    }
+
+    const flush = async () => {
+        if (buf_len) {
+            const chunk = buf.slice(0, buf_len)
+            buf_len = 0
+            if (log.is_debug()) {
+                log.debug(`upload pack flush: ${to_size(chunk.byteLength)} (${++pack_count} packs)`)
+            }
+            await serial_write(chunk)
+        }
+    }
+
+    const queue_flush = () => {
+        flush_chain = flush_chain.then(() => flush()).catch(() => { })
+    }
+
+    const start_timer = () => {
+        if (timer) return
+        timer = setTimeout(() => {
+            timer = null
+            queue_flush()
+        }, 1)
+    }
+
+    return {
+        write: async (chunk) => {
+            const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk)
+            if (!data.byteLength) return
+            if (data.byteLength >= target_size) {
+                // large chunk: flush partial + send directly
+                clear_timer()
+                if (buf_len) await flush()
+                if (log.is_debug()) {
+                    log.debug(`upload direct: ${to_size(data.byteLength)} (${++direct_count} direct)`)
+                }
+                await serial_write(data)
+                return
+            }
+            if (buf_len + data.byteLength >= target_size) {
+                // merged reaches target: send combined
+                const output = new Uint8Array(buf_len + data.byteLength)
+                output.set(buf.subarray(0, buf_len), 0)
+                output.set(data, buf_len)
+                buf_len = 0
+                clear_timer()
+                if (log.is_debug()) {
+                    log.debug(`upload pack merged: ${to_size(output.byteLength)} (${++pack_count} packs)`)
+                }
+                await serial_write(output)
+            } else {
+                // small chunk: buffer it, start 1ms flush timer
+                buf.set(data, buf_len)
+                buf_len += data.byteLength
+                buffered_count++
+                if (log.is_debug() && buffered_count % 100 === 0) {
+                    log.debug(`upload buffered: ${buffered_count} chunks, ${to_size(buf_len)} pending`)
+                }
+                start_timer()
+            }
+        },
+        end: async () => {
+            clear_timer()
+            try {
+                await flush_chain
+                await flush()
+            } finally {
+                if (log.is_debug()) {
+                    log.debug(`upload packer done: ${pack_count} packs, ${direct_count} direct, ${buffered_count} buffered`)
+                }
+            }
+        }
+    }
+}
+
+// Upload data from client to remote.
+// Uses the upload packer to batch small chunks into 20KB packets.
+// Logs every 100 chunks to avoid to_size() CPU overhead in debug mode.
+async function upload_to_remote(counter, log, writer, vless) {
+    let chunk_count = 0
+    const packer = create_upload_packer(writer, log)
+
+    const write = async (data) => {
+        if (!data || data.byteLength < 1) return
+        counter.add(data.byteLength)
+        if (log.is_debug() && ++chunk_count % 100 === 0) {
+            log.debug(`upload ${to_size(counter.get())} total`)
+        }
+        await packer.write(data)
+    }
+
+    // write the residual payload from the header first
+    await write(vless.data)
+
+    while (!vless.done) {
+        const r = await vless.reader.read(get_buffer())
+        vless.done = r.done
+        await write(r.value)
+    }
+    await packer.end()
+}
+
+function create_uploader(log, vless, writable) {
+    const counter = new Counter()
+    const done = new Promise((resolve, reject) => {
+        const writer = writable.getWriter()
+        upload_to_remote(counter, log, writer, vless)
+            .then(resolve)
+            .catch(reject)
+            .finally(() => {
+                // Close the upload writer as soon as upload completes.
+                // This sends FIN to the remote, signalling that the
+                // request body is complete. The remote will then start
+                // sending its response (the download direction).
+                writer
+                    .close()
+                    .then(() => log.debug(`upload writer closed`))
+                    .catch((err) => log.debug(`upload writer error: ${err}`))
+            })
+    })
+
+    return {
+        counter,
+        done,
+    }
+}
+
+// Download data from remote back to client.
+// Uses pipeTo() + TransformStream.
+//
+// IMPORTANT: pipeTo() is handled by the Cloudflare runtime, NOT by
+// JS code. When fetch() returns, the Worker's JS environment is
+// frozen, but pipeTo() continues to transfer data at the runtime
+// level. A JS BYOB read loop would stop when the Worker freezes,
+// causing the download to be interrupted.
+//
+// Each chunk is enqueued immediately (no batching) to preserve
+// real-time delivery critical for the VLESS handshake.
+function create_downloader(log, resp, remote_readable) {
+    const counter = new Counter()
+    let stream
+
+    const done = new Promise((resolve, reject) => {
+        let chunk_count = 0
+        stream = new TransformStream(
+            {
+                start(controller) {
+                    log.debug(`copy vless response`)
+                    counter.add(resp.length)
+                    controller.enqueue(resp)
+                },
+                transform(chunk, controller) {
+                    counter.add(chunk.byteLength)
+                    // Log every 100 chunks to avoid to_size() CPU
+                    // overhead in debug mode. to_size() has a loop
+                    // and division - calling it 51,200 times for a
+                    // 200MB file (4KB chunks) consumes significant
+                    // CPU time and triggers the CPU limit.
+                    if (log.is_debug() && ++chunk_count % 100 === 0) {
+                        log.debug(`download ${to_size(counter.get())} total`)
+                    }
+                    controller.enqueue(chunk)
+                },
+                cancel(reason) {
+                    reject(`download cancelled: ${reason}`)
+                },
+            },
+            null,
+            new ByteLengthQueuingStrategy({ highWaterMark: 1024 * 1024 }),
+        )
+        remote_readable.pipeTo(stream.writable).catch(reject).finally(resolve)
+    })
+
+    return {
+        readable: stream.readable,
+        counter,
+        done,
+    }
+}
+
+async function connect_to_remote(log, vless, ...remotes) {
+    const hostname = remotes.shift()
+    if (!hostname || hostname.length < 1) {
+        log.info('all attempts failed')
+        return null
+    }
+
+    if (vless.hostname === hostname) {
+        log.info(`direct connect [${vless.hostname}]:${vless.port}`)
+    } else {
+        log.info(`proxy [${vless.hostname}]:${vless.port} through ${hostname}`)
+    }
+
+    const retry = () => connect_to_remote(log, vless, ...remotes)
+    let remote
     try {
-      await writer.write(d);
-    } catch (error) {
-      throw error;
+        remote = connect({ hostname: hostname, port: vless.port })
+        const info = await remote.opened
+        log.debug(`connection opened:`, info)
+    } catch (err) {
+        log.error(`retry [${vless.hostname}] reason: ${err}`)
+        return await retry()
     }
-  }
 
-  try {
-    await inner_upload(httpx.data);
-    let chunkCount = 0;
-    while (!httpx.done) {
-      const r = await httpx.reader.read(get_xhttp_buffer());
-      if (r.done) break;
-      await inner_upload(r.value);
-      httpx.done = r.done;
-      chunkCount++;
-      if (chunkCount % 10 === 0) {
-        await xhttp_sleep(0);
-      }
-      if (!r.value || r.value.length === 0) {
-        await xhttp_sleep(2);
-      }
+    const uploader = create_uploader(log, vless, remote.writable)
+    const downloader = create_downloader(log, vless.resp, remote.readable)
+    return {
+        downloader,
+        uploader,
     }
-  } catch (error) {
-    throw error;
-  }
 }
 
-function create_xhttp_uploader(httpx, writable) {
-  const counter = new XhttpCounter();
-  const writer = writable.getWriter();
+async function handle_xhttp_client(log, body, cfg) {
+    const vless = await read_vless_header(body, cfg.UUID)
+    if (typeof vless !== 'object' || !vless) {
+        // to-do: drain connection
+        log.error(`failed to parse vless header: ${vless}`)
+        return null
+    }
 
-  const done = (async () => {
+    const r = await connect_to_remote(log, vless, vless.hostname, cfg.PROXY)
+    if (r === null) {
+        log.error('create remote stream failed')
+        return null
+    }
+
+    const connection_closed = new Promise((resolve, _) => {
+        r.downloader.done
+            .then(() => log.debug(`download complete`))
+            .catch((err) => log.error(`download error: ${err}`))
+            .finally(() => r.uploader.done)
+            .then(() => log.debug(`upload complete`))
+            .catch((err) => log.debug(`upload error: ${err}`))
+            .finally(() => {
+                const total_upload = to_size(r.uploader.counter.get())
+                const total_download = to_size(r.downloader.counter.get())
+                log.info(
+                    `connection closed. uploaded: ${total_upload} downloaded: ${total_download}`,
+                )
+                resolve()
+            })
+    })
+
+    return {
+        readable: r.downloader.readable,
+        closed: connection_closed,
+    }
+}
+
+async function handle_post(request, cfg) {
+    const log = new Logger(cfg.LOG_LEVEL)
     try {
-      await upload_to_remote_xhttp(counter, writer, httpx);
-    } catch (error) {
-      throw error;
-    } finally {
-      try {
-        await writer.close();
-      } catch (error) {}
+        return await handle_xhttp_client(log, request.body, cfg)
+    } catch (err) {
+        log.error(`error: ${err}`)
     }
-  })();
-
-  return {
-    counter,
-    done,
-    abort: () => {
-      try { writer.abort(); } catch (_) {}
-    }
-  };
+    return null
 }
 
-// ============ 下载器：远程 -> 客户端 ============
+function create_config(url, uuid) {
+    const config = JSON.parse(config_template)
+    const vless = config['outbounds'][0]['settings']['vnext'][0]
+    const stream = config['outbounds'][0]['streamSettings']
 
-function create_xhttp_downloader(resp, remote_readable) {
-  const counter = new XhttpCounter();
-  let stream;
+    // workers are TLS only!
+    const host = url.hostname
+    const path = url.pathname
+    vless['address'] = host
+    vless['users'][0]['id'] = uuid
+    stream['xhttpSettings']['host'] = host
+    stream['xhttpSettings']['path'] = path.endsWith('/') ? path : `${path}/`
+    stream['tlsSettings']['serverName'] = host
 
-  const done = new Promise((resolve, reject) => {
-    stream = new TransformStream(
-      {
-        start(controller) {
-          counter.add(resp.length);
-          controller.enqueue(resp);
-        },
-        transform(chunk, controller) {
-          counter.add(chunk.length);
-          controller.enqueue(chunk);
-        },
-        cancel(reason) {
-          reject(`download cancelled: ${reason}`);
-        },
+    return JSON.stringify(config)
+}
+
+const config_template = `{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "agentin",
+      "port": 1080,
+      "listen": "127.0.0.1",
+      "protocol": "socks",
+      "settings": {}
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "localhost",
+            "port": 443,
+            "users": [
+              {
+                "id": "",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
       },
-      null,
-      new ByteLengthQueuingStrategy({ highWaterMark: CONFIG.bufferSize }),
-    );
-
-    let lastActivity = Date.now();
-    const idleTimer = setInterval(() => {
-      if (Date.now() - lastActivity > CONFIG.idleTimeoutMs) {
-        try {
-          stream.writable.abort?.('idle timeout');
-        } catch (_) {}
-        clearInterval(idleTimer);
-        reject('idle timeout');
-      }
-    }, 5000);
-
-    const reader = remote_readable.getReader();
-    const writer = stream.writable.getWriter();
-
-    ;(async () => {
-      try {
-        let chunkCount = 0;
-        while (true) {
-          const r = await reader.read();
-          if (r.done) {
-            break;
-          }
-          lastActivity = Date.now();
-          await writer.write(r.value);
-          chunkCount++;
-          if (chunkCount % 5 === 0) {
-            await xhttp_sleep(0);
-          }
-        }
-        await writer.close();
-        resolve();
-      } catch (err) {
-        reject(err);
-      } finally {
-        try {
-          reader.releaseLock();
-        } catch (_) {}
-        try {
-          writer.releaseLock();
-        } catch (_) {}
-        clearInterval(idleTimer);
-      }
-    })();
-  });
-
-  return {
-    readable: stream.readable,
-    counter,
-    done,
-    abort: () => {
-      try { stream.readable.cancel(); } catch (_) {}
-      try { stream.writable.abort(); } catch (_) {}
-    }
-  };
-}
-
-// ============ 远程连接管理 ============
-
-async function connect_to_remote_xhttp(httpx, ...remotes) {
-  let attempt = 0;
-  let lastErr;
-
-  const connectionList = [httpx.hostname, ...remotes.filter(r => r && r !== httpx.hostname)];
-
-  for (const hostname of connectionList) {
-    if (!hostname) continue;
-
-    attempt = 0;
-    while (attempt < CONFIG.maxRetries) {
-      attempt++;
-      try {
-        const remote = connect({ hostname, port: httpx.port });
-        const timeoutPromise = xhttp_sleep(CONFIG.connectTimeoutMs).then(() => {
-          throw new Error('connect timeout');
-        });
-
-        await Promise.race([remote.opened, timeoutPromise]);
-
-        const uploader = create_xhttp_uploader(httpx, remote.writable);
-        const downloader = create_xhttp_downloader(httpx.resp, remote.readable);
-
-        return {
-          downloader,
-          uploader,
-          close: () => {
-            try { remote.close(); } catch (_) {}
-          }
-        };
-      } catch (err) {
-        lastErr = err;
-        if (attempt < CONFIG.maxRetries) {
-          await xhttp_sleep(500 * attempt);
+      "tag": "agentout",
+      "streamSettings": {
+        "network": "xhttp",
+        "xhttpSettings": {
+          "mode": "stream-one",
+          "host": "localhost",
+          "path": "/path/",
+          "noGRPCHeader": false,
+          "keepAlivePeriod": 300
+        },
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "localhost",
+          "alpn": [
+            "h2"
+          ]
         }
       }
     }
-  }
+  ]
+}`
 
-  return null;
+async function fetch(request, env, ctx) {
+    const cfg = {
+        UUID: env.UUID || UUID,
+        PROXY: env.PROXY || PROXY,
+        LOG_LEVEL: env.LOG_LEVEL || LOG_LEVEL,
+    }
+
+    if (!cfg.UUID) {
+        return new Response(`Error: UUID is empty`)
+    }
+
+    if (request.method === 'POST') {
+        const r = await handle_post(request, cfg)
+        if (r) {
+            // IMPORTANT: Do NOT use ctx.waitUntil(r.closed) here.
+            // waitUntil() only keeps the Worker alive for a few seconds
+            // after fetch() returns. For large file downloads that take
+            // longer, the waitUntil task gets cancelled, which tears down
+            // the entire connection. Just return the stream directly and
+            // let Cloudflare's streaming response handle the long-lived
+            // connection.
+            return new Response(r.readable, {
+                headers: {
+                    'X-Accel-Buffering': 'no',
+                    'Cache-Control': 'no-store',
+                    Connection: 'Keep-Alive',
+                    'User-Agent': 'Go-http-client/2.0',
+                    'Content-Type': 'application/grpc',
+                    // 'Content-Type': 'text/event-stream',
+                    // 'Transfer-Encoding': 'chunked',
+                },
+            })
+        }
+    }
+
+    if (request.method === 'GET') {
+        const url = new URL(request.url)
+        const items = [url.pathname, url.search]
+        for (let item of items) {
+            if (item.indexOf(`${cfg.UUID}`) >= 0) {
+                const config = create_config(url, cfg.UUID)
+                return new Response(config, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                })
+            }
+        }
+    }
+    return new Response(`Hello world!`)
 }
-
-// ============ XHTTP 客户端处理 ============
-
-async function handle_xhttp_client(body, uuid) {
-  if (ACTIVE_CONNECTIONS >= CONFIG.maxConcurrent) {
-    return { error: 429 };
-  }
-
-  ACTIVE_CONNECTIONS++;
-
-  let cleaned = false;
-  const cleanup = () => {
-    if (!cleaned) {
-      ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
-      cleaned = true;
-    }
-  };
-
-  try {
-    const httpx = await read_xhttp_header(body, uuid);
-    if (typeof httpx !== 'object' || !httpx) {
-      return null;
-    }
-
-    const fallbackList = [];
-    if (CONFIG.fallbackAddress) {
-      fallbackList.push(CONFIG.fallbackAddress);
-    }
-
-    const remoteConnection = await connect_to_remote_xhttp(httpx, ...fallbackList);
-    if (remoteConnection === null) {
-      return null;
-    }
-
-    const connectionClosed = Promise.race([
-      (async () => {
-        try {
-          await remoteConnection.downloader.done;
-        } catch (err) {}
-      })(),
-      (async () => {
-        try {
-          await remoteConnection.uploader.done;
-        } catch (err) {}
-      })(),
-      xhttp_sleep(CONFIG.idleTimeoutMs).then(() => {})
-    ]).finally(() => {
-      try { remoteConnection.close(); } catch (_) {}
-      try { remoteConnection.downloader.abort(); } catch (_) {}
-      try { remoteConnection.uploader.abort(); } catch (_) {}
-      cleanup();
-    });
-
-    return {
-      readable: remoteConnection.downloader.readable,
-      closed: connectionClosed
-    };
-  } catch (error) {
-    cleanup();
-    return null;
-  }
-}
-
-// ============ 从环境变量加载配置 ============
-
-function loadConfigFromEnv(env) {
-  const cfg = { ...DEFAULT_CONFIG };
-  if (env.UUID || env.U) cfg.uuid = env.UUID || env.U;
-  if (env.FALLBACK || env.F) cfg.fallbackAddress = env.FALLBACK || env.F;
-  if (env.MAX_CONCURRENT) cfg.maxConcurrent = parseInt(env.MAX_CONCURRENT);
-  if (env.BUFFER_SIZE) cfg.bufferSize = parseInt(env.BUFFER_SIZE);
-  if (env.CONNECT_TIMEOUT) cfg.connectTimeoutMs = parseInt(env.CONNECT_TIMEOUT);
-  if (env.IDLE_TIMEOUT) cfg.idleTimeoutMs = parseInt(env.IDLE_TIMEOUT);
-  if (env.MAX_RETRIES) cfg.maxRetries = parseInt(env.MAX_RETRIES);
-  return cfg;
-}
-
-// ============ 主入口 ============
 
 export default {
-  async fetch(request, env, ctx) {
-    CONFIG = loadConfigFromEnv(env);
+    fetch,
 
-    if (!CONFIG.uuid) {
-      return new Response('UUID is required. Set UUID or U environment variable.', { status: 400 });
-    }
-
-    if (request.method !== 'POST') {
-      return new Response('Method Not Allowed', { status: 405 });
-    }
-
-    const r = await handle_xhttp_client(request.body, CONFIG.uuid);
-    if (!r) {
-      return new Response('Internal Server Error', { status: 500 });
-    }
-
-    if (r.error === 429) {
-      return new Response('Too many connections', { status: 429 });
-    }
-
-    ctx.waitUntil(r.closed);
-    return new Response(r.readable, {
-      headers: {
-        'X-Accel-Buffering': 'no',
-        'Cache-Control': 'no-store',
-        'Connection': 'keep-alive',
-        'User-Agent': 'Go-http-client/2.0',
-        'Content-Type': 'application/grpc',
-      },
-    });
-  }
-};
+    // for unit testing
+    parse_uuid,
+    validate_uuid,
+    concat_typed_arrays,
+}
