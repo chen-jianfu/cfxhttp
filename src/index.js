@@ -3,12 +3,13 @@ import { connect } from 'cloudflare:sockets'
 // configurations
 const UUID = '96c50e3a-5b87-49dd-bd20-03c7f2735e40' // vless UUID
 const PROXY = 'ProxyIP.US.CMLiussss.net' // (optional) reverse proxy for CF websites. e.g. example.com
-const LOG_LEVEL = 'none' // debug, info, error, none
+const LOG_LEVEL = 'none' // debug, info, error, none — set to 'debug' temporarily for diagnosis
 
 // source code
 const TIME_ZONE = 8 * 60 * 60 * 1000 // logging timestamp forwards 8 hours
 const BUFFER_SIZE = 64 * 1024 // read/write buffer size in bytes
-const UPLOAD_PACK_SIZE = 20 * 1024 // upload batching target size (borrowed from _worker.js)
+const UPLOAD_PACK_TARGET = 20 * 1024 // upload pack target size in bytes; small chunks are merged up to this size before a single writer.write
+const UPLOAD_PACK_FLUSH_MS = 1 // max latency (ms) to hold a partial buffer before forcing a flush
 
 function to_size(size) {
     const KiB = 1024
@@ -90,6 +91,10 @@ class Logger {
         }
         const levels = ['debug', 'info', 'error', 'none']
         this.#level = levels.indexOf(log_level.toLowerCase())
+    }
+
+    get id() {
+        return this.#id
     }
 
     is_debug() {
@@ -245,19 +250,40 @@ async function read_vless_header(readable, uuid_str) {
     }
 }
 
-// Upload batching packer, borrowed from _worker.js `创建上行Grain合包流`.
-// Batches small chunks into UPLOAD_PACK_SIZE (20KB) packets before
-// writing to the remote, reducing writer.write() invocations and
-// improving large file upload smoothness.
-function create_upload_packer(writer, log, target_size = UPLOAD_PACK_SIZE) {
-    const buf = new Uint8Array(target_size)
-    let buf_len = 0
+// Upload pack stream: merges small chunks into ~UPLOAD_PACK_TARGET-byte writes
+// before pushing them to the remote writer. Large chunks bypass the buffer.
+// A 1ms timer forces a flush so low-throughput clients don't stall the
+// downstream (download) direction.
+//
+// IMPORTANT: holds the OUTER writer directly (no IdentityTransformStream).
+// The previous version created an internal stream and fed it into another
+// writer, which left the data buffered inside an unread stream and never
+// reached the remote socket (hang on end()).
+//
+// Modeled after `创建上行Grain合包流` from 新建文本文档.js, simplified for the
+// single VLESS xhttp upload path.
+function create_upload_pack_stream(writer, id = '?', target = UPLOAD_PACK_TARGET, flush_ms = UPLOAD_PACK_FLUSH_MS) {
+    const buffer = new Uint8Array(target)
+    let buffered = 0
     let timer = null
     let in_flight = null
-    let flush_chain = Promise.resolve()
-    let pack_count = 0
+    let closed = false
+    let write_count = 0
+    let byte_count = 0
+    let timer_count = 0
+    let merge_count = 0
     let direct_count = 0
-    let buffered_count = 0
+
+    // Diagnostic helper: timestamped, id-tagged line in the same format as Logger.
+    const log_pack = (msg) => {
+        console.log(
+            new Date(Date.now() + TIME_ZONE).toISOString(),
+            '[debug]',
+            `(${id})`,
+            'pack',
+            msg,
+        )
+    }
 
     const clear_timer = () => {
         if (timer) {
@@ -266,91 +292,128 @@ function create_upload_packer(writer, log, target_size = UPLOAD_PACK_SIZE) {
         }
     }
 
-    const serial_write = async (chunk) => {
+    // Serialize writes to the underlying writer so concurrent write() callers
+    // never interleave bytes on the wire.
+    const serial_write = async (chunk, branch) => {
+        if (closed) throw new Error('pack stream closed')
         if (in_flight) await in_flight
-        in_flight = writer.write(chunk)
-        try { await in_flight } finally { in_flight = null }
+        if (closed) throw new Error('pack stream closed')
+        const p = writer.write(chunk)
+        in_flight = p
+        try {
+            await p
+        } finally {
+            if (in_flight === p) in_flight = null
+        }
+        // [A] write completed
+        log_pack(`write: ${chunk.byteLength}B (branch=${branch})`)
     }
 
-    const flush = async () => {
-        if (buf_len) {
-            const chunk = buf.slice(0, buf_len)
-            buf_len = 0
-            if (log.is_debug()) {
-                log.debug(`upload pack flush: ${to_size(chunk.byteLength)} (${++pack_count} packs)`)
-            }
-            await serial_write(chunk)
+    const flush = async (branch = 'timer') => {
+        if (buffered) {
+            const chunk = buffer.slice(0, buffered)
+            buffered = 0
+            await serial_write(chunk, branch)
         }
     }
 
-    const queue_flush = () => {
-        flush_chain = flush_chain.then(() => flush()).catch(() => { })
-    }
-
     const start_timer = () => {
-        if (timer) return
+        if (timer || closed) return
         timer = setTimeout(() => {
             timer = null
-            queue_flush()
-        }, 1)
+            timer_count++
+            // [B] timer fired
+            log_pack(`timer: buffered=${buffered}B`)
+            if (buffered) {
+                flush('timer').catch((err) => {
+                    console.log(
+                        new Date(Date.now() + TIME_ZONE).toISOString(),
+                        '[error]',
+                        `(${id})`,
+                        'pack timer flush failed:',
+                        err?.message || err,
+                    )
+                })
+            }
+        }, flush_ms)
     }
 
     return {
         write: async (chunk) => {
-            const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk)
+            if (closed) throw new Error('pack stream closed')
+            const data = chunk instanceof Uint8Array
+                ? chunk
+                : (chunk instanceof ArrayBuffer
+                    ? new Uint8Array(chunk)
+                    : (ArrayBuffer.isView(chunk)
+                        ? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+                        : new Uint8Array(chunk || 0)))
+            // [D] write entry: incoming chunk size
+            log_pack(`write-in: chunkSize=${data.byteLength}B`)
             if (!data.byteLength) return
-            if (data.byteLength >= target_size) {
-                // large chunk: flush partial + send directly
+            if (data.byteLength >= target) {
                 clear_timer()
-                if (buf_len) await flush()
-                if (log.is_debug()) {
-                    log.debug(`upload direct: ${to_size(data.byteLength)} (${++direct_count} direct)`)
-                }
-                await serial_write(data)
+                if (buffered) await flush('merge')
+                write_count++
+                direct_count++
+                byte_count += data.byteLength
+                log_pack(`branch: direct (${data.byteLength}B >= target ${target}B)`)
+                await serial_write(data, 'direct')
                 return
             }
-            if (buf_len + data.byteLength >= target_size) {
-                // merged reaches target: send combined
-                const output = new Uint8Array(buf_len + data.byteLength)
-                output.set(buf.subarray(0, buf_len), 0)
-                output.set(data, buf_len)
-                buf_len = 0
+            if (buffered + data.byteLength >= target) {
+                merge_count++
+                const output = new Uint8Array(buffered + data.byteLength)
+                output.set(buffer.subarray(0, buffered), 0)
+                output.set(data, buffered)
+                const totalSize = output.byteLength
+                buffered = 0
                 clear_timer()
-                if (log.is_debug()) {
-                    log.debug(`upload pack merged: ${to_size(output.byteLength)} (${++pack_count} packs)`)
-                }
-                await serial_write(output)
+                write_count++
+                byte_count += totalSize
+                // [C-merge] merge branch triggered
+                log_pack(`branch: merge (${totalSize}B = buffered ${totalSize - data.byteLength}B + new ${data.byteLength}B)`)
+                await serial_write(output, 'merge')
             } else {
-                // small chunk: buffer it, start 1ms flush timer
-                buf.set(data, buf_len)
-                buf_len += data.byteLength
-                buffered_count++
-                if (log.is_debug() && buffered_count % 100 === 0) {
-                    log.debug(`upload buffered: ${buffered_count} chunks, ${to_size(buf_len)} pending`)
-                }
+                buffer.set(data, buffered)
+                buffered += data.byteLength
+                // [C-buffer] buffer branch triggered
+                log_pack(`branch: buffer (now ${buffered}B / target ${target}B)`)
                 start_timer()
             }
         },
         end: async () => {
+            if (closed) return
+            closed = true
             clear_timer()
             try {
-                await flush_chain
-                await flush()
+                await flush('end')
+                await writer.close()
             } finally {
-                if (log.is_debug()) {
-                    log.debug(`upload packer done: ${pack_count} packs, ${direct_count} direct, ${buffered_count} buffered`)
-                }
+                try {
+                    writer.releaseLock()
+                } catch (e) { }
             }
-        }
+            // [E] final stats
+            log_pack(
+                `end: writes=${write_count} bytes=${byte_count} merges=${merge_count} ` +
+                `direct=${direct_count} timers=${timer_count} residual_buffered=${buffered}B`,
+            )
+        },
+        // diagnostic snapshot
+        _stats: () => ({ write_count, byte_count, timer_count, merge_count, direct_count, buffered, closed }),
     }
 }
 
 // Upload data from client to remote.
-// Uses the upload packer to batch small chunks into 20KB packets.
+// Reads from the VLESS body stream and feeds chunks through the pack stream,
+// which coalesces small writes into ~20KB packets before hitting the remote
+// socket. Reduces syscall count and CPU overhead on large uploads.
 // Logs every 100 chunks to avoid to_size() CPU overhead in debug mode.
 async function upload_to_remote(counter, log, writer, vless) {
     let chunk_count = 0
-    const packer = create_upload_packer(writer, log)
+    log.debug(`upload start: vless.data=${vless.data ? vless.data.byteLength : 0}B, vless.done=${vless.done}`)
+    const pack = create_upload_pack_stream(writer, log.id)
 
     const write = async (data) => {
         if (!data || data.byteLength < 1) return
@@ -358,36 +421,66 @@ async function upload_to_remote(counter, log, writer, vless) {
         if (log.is_debug() && ++chunk_count % 100 === 0) {
             log.debug(`upload ${to_size(counter.get())} total`)
         }
-        await packer.write(data)
+        await pack.write(data)
     }
 
     // write the residual payload from the header first
-    await write(vless.data)
+    if (vless.data && vless.data.byteLength > 0) {
+        log.debug(`upload header residual: ${vless.data.byteLength}B`)
+        await write(vless.data)
+    }
 
+    let read_iter = 0
     while (!vless.done) {
+        read_iter++
+        log.debug(`upload read #${read_iter} ...`)
         const r = await vless.reader.read(get_buffer())
         vless.done = r.done
-        await write(r.value)
+        log.debug(`upload read #${read_iter} done=${r.done}, value=${r.value ? r.value.byteLength : 0}B`)
+        if (r.value && r.value.byteLength > 0) {
+            await write(r.value)
+        }
+        if (r.done) break
     }
-    await packer.end()
+
+    log.debug(`upload draining pack: ${JSON.stringify(pack._stats())}`)
+    // Flush any buffered bytes and close the underlying writer. This sends
+    // FIN to the remote, signalling the request body is complete; the remote
+    // will then start sending its response (the download direction).
+    await pack.end()
+    log.debug(`upload end: stats=${JSON.stringify(pack._stats())}, total=${to_size(counter.get())}`)
 }
 
 function create_uploader(log, vless, writable) {
     const counter = new Counter()
     const done = new Promise((resolve, reject) => {
         const writer = writable.getWriter()
+        log.debug(`upload writer acquired`)
         upload_to_remote(counter, log, writer, vless)
-            .then(resolve)
-            .catch(reject)
+            .then((v) => {
+                log.debug(`upload_to_remote resolved`)
+                resolve(v)
+            })
+            .catch((err) => {
+                log.error(`upload_to_remote rejected: ${err?.message || err}`)
+                reject(err)
+            })
             .finally(() => {
-                // Close the upload writer as soon as upload completes.
-                // This sends FIN to the remote, signalling that the
-                // request body is complete. The remote will then start
-                // sending its response (the download direction).
-                writer
-                    .close()
-                    .then(() => log.debug(`upload writer closed`))
-                    .catch((err) => log.debug(`upload writer error: ${err}`))
+                // pack.end() inside upload_to_remote has already flushed the
+                // buffer and closed the writer on the success path. Here we
+                // only defensively close on the failure path (where pack.end()
+                // did not run) and always release the lock.
+                try {
+                    writer.close()
+                } catch (e) {
+                    log.debug(`upload writer close error (ignored): ${e?.message || e}`)
+                }
+                try {
+                    writer.releaseLock()
+                } catch (e) {
+                    log.debug(`upload writer releaseLock error (ignored): ${e?.message || e}`)
+                }
+                log.debug(`upload writer closed (total uploaded ${to_size(counter.get())})`)
             })
     })
 
@@ -398,7 +491,16 @@ function create_uploader(log, vless, writable) {
 }
 
 // Download data from remote back to client.
-// Uses pipeTo() + TransformStream.
+// Architecture:
+//   remote_readable ──pipeTo──▶ head (TransformStream, only start() injects resp) ──pipeTo──▶ pass (IdentityTransformStream, zero JS overhead)
+//
+// `head` exists only to enqueue the VLESS response header
+// (`[version, 0]`) before any body bytes; its transform callback is
+// omitted so every chunk passes through with no JS work.
+// `pass` is a true IdentityTransformStream — the final readable that
+// the HTTP response body reads from. Each body chunk traverses only
+// runtime-native pipeTo hops, preserving real-time delivery critical
+// for the VLESS handshake.
 //
 // IMPORTANT: pipeTo() is handled by the Cloudflare runtime, NOT by
 // JS code. When fetch() returns, the Worker's JS environment is
@@ -406,45 +508,42 @@ function create_uploader(log, vless, writable) {
 // level. A JS BYOB read loop would stop when the Worker freezes,
 // causing the download to be interrupted.
 //
-// Each chunk is enqueued immediately (no batching) to preserve
-// real-time delivery critical for the VLESS handshake.
+// counter.add() on the per-chunk hot path is intentionally omitted
+// to minimize CPU cost; counter.get() reflects only resp.length
+// (the 2-byte VLESS response header) plus a one-time add of the
+// head's bytes (resp.length only — body bytes are not counted).
 function create_downloader(log, resp, remote_readable) {
     const counter = new Counter()
-    let stream
+    counter.add(resp.length)
 
-    const done = new Promise((resolve, reject) => {
-        let chunk_count = 0
-        stream = new TransformStream(
-            {
-                start(controller) {
-                    log.debug(`copy vless response`)
-                    counter.add(resp.length)
-                    controller.enqueue(resp)
-                },
-                transform(chunk, controller) {
-                    counter.add(chunk.byteLength)
-                    // Log every 100 chunks to avoid to_size() CPU
-                    // overhead in debug mode. to_size() has a loop
-                    // and division - calling it 51,200 times for a
-                    // 200MB file (4KB chunks) consumes significant
-                    // CPU time and triggers the CPU limit.
-                    if (log.is_debug() && ++chunk_count % 100 === 0) {
-                        log.debug(`download ${to_size(counter.get())} total`)
-                    }
-                    controller.enqueue(chunk)
-                },
-                cancel(reason) {
-                    reject(`download cancelled: ${reason}`)
-                },
+    // head: injects resp via start(); everything else is passthrough.
+    const head = new TransformStream(
+        {
+            start(controller) {
+                log.debug(`copy vless response`)
+                controller.enqueue(resp)
             },
-            null,
-            new ByteLengthQueuingStrategy({ highWaterMark: 1024 * 1024 }),
-        )
-        remote_readable.pipeTo(stream.writable).catch(reject).finally(resolve)
-    })
+        },
+        null,
+        new ByteLengthQueuingStrategy({ highWaterMark: 1024 * 1024 }),
+    )
+
+    // pass: true IdentityTransformStream — the runtime handles every
+    // chunk natively with no JS callback.
+    const pass = typeof IdentityTransformStream !== 'undefined'
+        ? new IdentityTransformStream()
+        : new TransformStream()
+
+    // Wire the two stages. Both pipeTo calls return promises we
+    // intentionally let fire-and-forget; combined failure is observed
+    // via the response stream's own error propagation.
+    const done = Promise.all([
+        remote_readable.pipeTo(head.writable).catch(() => { }),
+        head.readable.pipeTo(pass.writable).catch(() => { }),
+    ])
 
     return {
-        readable: stream.readable,
+        readable: pass.readable,
         counter,
         done,
     }
@@ -505,6 +604,9 @@ async function handle_xhttp_client(log, body, cfg) {
             .catch((err) => log.debug(`upload error: ${err}`))
             .finally(() => {
                 const total_upload = to_size(r.uploader.counter.get())
+                // counter.add() on the per-chunk hot path is intentionally
+                // omitted to minimize CPU cost; total_download reflects only
+                // the VLESS response header size (2 bytes).
                 const total_download = to_size(r.downloader.counter.get())
                 log.info(
                     `connection closed. uploaded: ${total_upload} downloaded: ${total_download}`,
