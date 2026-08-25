@@ -3,7 +3,8 @@ import { connect } from 'cloudflare:sockets'
 // configurations
 const UUID = '96c50e3a-5b87-49dd-bd20-03c7f2735e40' // vless UUID
 const PROXY = 'ProxyIP.US.CMLiussss.net' // (optional) reverse proxy for CF websites. e.g. example.com
-const LOG_LEVEL = 'none' // debug, info, error, none — set to 'debug' temporarily for diagnosis
+const LOG_LEVEL = 'none' // only 'debug'/'info'/'error' enable their respective logs; 'none' disables all. Logger fail-closes, so any invalid value also disables all logs.
+const BUILD_VER = 'xhttp-20260825-fix1' // build marker — helps verify which version Cloudflare is actually running
 
 // source code
 const TIME_ZONE = 8 * 60 * 60 * 1000 // logging timestamp forwards 8 hours
@@ -55,7 +56,7 @@ function calc_hpack_huffman_bytes(str) {
 }
 
 // Extract padding value from request (supports queryInHeader placement)
-function extract_xhttp_padding(request, header_name, key_name) {
+function extract_xhttp_padding(request, header_name, key_name, log) {
     const header_val = request.headers.get(header_name)
     if (header_val) {
         try {
@@ -63,34 +64,35 @@ function extract_xhttp_padding(request, header_name, key_name) {
             const parsed = new URL(header_val, 'https://x.invalid')
             const query_val = parsed.searchParams.get(key_name)
             if (query_val) {
-                console.log(`[xhttp-obfs] extracted from header URL query: key='${key_name}', padding_len=${query_val.length}`)
+                log?.debug(`[xhttp-obfs] extracted from header URL query: key='${key_name}', padding_len=${query_val.length}`)
                 return query_val
             }
         } catch (e) { }
-        console.log(`[xhttp-obfs] using direct header value: header='${header_name}', padding_len=${header_val.length}`)
+        log?.debug(`[xhttp-obfs] using direct header value: header='${header_name}', padding_len=${header_val.length}`)
         return header_val // direct header value
     }
     // fallback: request URL query string
     const url = new URL(request.url)
     const query_padding = url.searchParams.get(key_name) || ''
     if (query_padding) {
-        console.log(`[xhttp-obfs] extracted from URL query: key='${key_name}', padding_len=${query_padding.length}`)
+        log?.debug(`[xhttp-obfs] extracted from URL query: key='${key_name}', padding_len=${query_padding.length}`)
     }
     return query_padding
 }
 
 // Validate padding: HPACK Huffman length in [98, 1002]
-function validate_xhttp_padding(request, header_name, key_name) {
-    const padding = extract_xhttp_padding(request, header_name, key_name)
+function validate_xhttp_padding(request, header_name, key_name, log) {
+    const padding = extract_xhttp_padding(request, header_name, key_name, log)
     if (!padding) {
-        console.log(`[xhttp-obfs] no padding present -> PASS (allow empty)`)
+        log?.debug(`[xhttp-obfs] no padding present -> PASS (allow empty)`)
         return true // no padding = pass
     }
     const huff_len = calc_hpack_huffman_bytes(padding)
     const ok = huff_len >= 98 && huff_len <= 1002
-    console.log(`[xhttp-obfs] validation: huffman_len=${huff_len} bytes, range=[98,1002] -> ${ok ? 'PASS' : 'FAIL'}`)
+    log?.debug(`[xhttp-obfs] validation: huffman_len=${huff_len} bytes, range=[98,1002] -> ${ok ? 'PASS' : 'FAIL'}`)
     if (!ok) {
-        console.log(`[xhttp-obfs] FAIL detail: padding_chars=${padding.length}, first_50='${padding.slice(0, 50)}...'`)n    }
+        log?.debug(`[xhttp-obfs] FAIL detail: padding_chars=${padding.length}, first_50='${padding.slice(0, 50)}...'`)
+    }
     return ok
 }
 
@@ -104,11 +106,11 @@ function gen_xhttp_padding_str(len) {
 }
 
 // Build response headers with obfs padding (queryInHeader format)
-function build_xhttp_response_headers(uuid_str) {
+function build_xhttp_response_headers(uuid_str, log) {
     const { header, key } = get_xhttp_padding_ident(uuid_str)
     const padding = gen_xhttp_padding_str(100 + Math.floor(Math.random() * 901)) // 100-1000
     const huff_len = calc_hpack_huffman_bytes(padding)
-    console.log(`[xhttp-obfs] response: header='${header}', key='${key}', padding_chars=${padding.length}, huffman=${huff_len} bytes`)
+    log?.debug(`[xhttp-obfs] response: header='${header}', key='${key}', padding_chars=${padding.length}, huffman=${huff_len} bytes`)
     const url = new URL('https://x.invalid/')
     url.searchParams.set(key, padding)
     const headers = {
@@ -197,11 +199,14 @@ class Logger {
     constructor(log_level) {
         this.#id = random_id()
 
-        if (typeof log_level !== 'string') {
-            log_level = 'info'
-        }
+        // Fail-closed: non-string or unrecognized values disable ALL logging.
+        // The previous default of 'info' could resurrect logs when a stale/
+        // malformed value was passed. Only an explicit valid level works.
         const levels = ['debug', 'info', 'error', 'none']
-        this.#level = levels.indexOf(log_level.toLowerCase())
+        const idx = typeof log_level === 'string'
+            ? levels.indexOf(log_level.toLowerCase())
+            : -1
+        this.#level = idx < 0 ? 3 : idx // invalid -> 'none' (fully silent)
     }
 
     get id() {
@@ -373,7 +378,7 @@ async function read_vless_header(readable, uuid_str) {
 //
 // Modeled after `创建上行Grain合包流` from 新建文本文档.js, simplified for the
 // single VLESS xhttp upload path.
-function create_upload_pack_stream(writer, id = '?', target = UPLOAD_PACK_TARGET, flush_ms = UPLOAD_PACK_FLUSH_MS) {
+function create_upload_pack_stream(writer, log, target = UPLOAD_PACK_TARGET, flush_ms = UPLOAD_PACK_FLUSH_MS) {
     const buffer = new Uint8Array(target)
     let buffered = 0
     let timer = null
@@ -385,15 +390,9 @@ function create_upload_pack_stream(writer, id = '?', target = UPLOAD_PACK_TARGET
     let merge_count = 0
     let direct_count = 0
 
-    // Diagnostic helper: timestamped, id-tagged line in the same format as Logger.
+    // Diagnostic helper: uses the passed Logger instance (respects LOG_LEVEL)
     const log_pack = (msg) => {
-        console.log(
-            new Date(Date.now() + TIME_ZONE).toISOString(),
-            '[debug]',
-            `(${id})`,
-            'pack',
-            msg,
-        )
+        log.debug('pack', msg)
     }
 
     const clear_timer = () => {
@@ -437,13 +436,7 @@ function create_upload_pack_stream(writer, id = '?', target = UPLOAD_PACK_TARGET
             log_pack(`timer: buffered=${buffered}B`)
             if (buffered) {
                 flush('timer').catch((err) => {
-                    console.log(
-                        new Date(Date.now() + TIME_ZONE).toISOString(),
-                        '[error]',
-                        `(${id})`,
-                        'pack timer flush failed:',
-                        err?.message || err,
-                    )
+                    log.error('pack timer flush failed:', err?.message || err)
                 })
             }
         }, flush_ms)
@@ -524,7 +517,7 @@ function create_upload_pack_stream(writer, id = '?', target = UPLOAD_PACK_TARGET
 async function upload_to_remote(counter, log, writer, vless) {
     let chunk_count = 0
     log.debug(`upload start: vless.data=${vless.data ? vless.data.byteLength : 0}B, vless.done=${vless.done}`)
-    const pack = create_upload_pack_stream(writer, log.id)
+    const pack = create_upload_pack_stream(writer, log)
 
     const write = async (data) => {
         if (!data || data.byteLength < 1) return
@@ -740,7 +733,7 @@ async function handle_post(request, cfg) {
         log.debug(`xhttp-obfs: derived header='${header}', key='${key}'`)
         
         // Extract padding for detailed logging
-        const extracted = extract_xhttp_padding(request, header, key)
+        const extracted = extract_xhttp_padding(request, header, key, log)
         if (extracted) {
             const huffLen = calc_hpack_huffman_bytes(extracted)
             log.debug(`xhttp-obfs: extracted padding len=${extracted.length} chars, huffman=${huffLen} bytes`)
@@ -748,7 +741,7 @@ async function handle_post(request, cfg) {
             log.debug(`xhttp-obfs: no padding found in request`)
         }
         
-        if (!validate_xhttp_padding(request, header, key)) {
+        if (!validate_xhttp_padding(request, header, key, log)) {
             log.error(`xhttp-obfs: validation FAILED (header='${header}', key='${key}')`)
             return null
         }
@@ -757,7 +750,7 @@ async function handle_post(request, cfg) {
         const result = await handle_xhttp_client(log, request.body, cfg)
         if (result) {
             // Attach response headers with obfs padding
-            result.response_headers = build_xhttp_response_headers(cfg.UUID)
+            result.response_headers = build_xhttp_response_headers(cfg.UUID, log)
             const { header: rh, key: rk } = get_xhttp_padding_ident(cfg.UUID)
             log.debug(`xhttp-obfs: response header '${rh}' set with queryInHeader padding`)
         }
@@ -768,7 +761,7 @@ async function handle_post(request, cfg) {
     return null
 }
 
-function create_config(url, uuid) {
+function create_config(url, uuid, log) {
     const config = JSON.parse(config_template)
     const vless = config['outbounds'][0]['settings']['vnext'][0]
     const stream = config['outbounds'][0]['streamSettings']
@@ -783,8 +776,8 @@ function create_config(url, uuid) {
     stream['tlsSettings']['serverName'] = host
 
     // inject xPadding obfs config (extra)
-    console.log(`[xhttp-obfs] subscription: header='${header}', key='${key}' -> extra injected`)
     const { header, key } = get_xhttp_padding_ident(uuid)
+    log?.debug(`[xhttp-obfs] subscription: header='${header}', key='${key}' -> extra injected`)
     stream['xhttpSettings']['extra'] = {
         xPaddingObfsMode: true,
         xPaddingMethod: 'tokenish',
@@ -888,7 +881,8 @@ async function fetch(request, env, ctx) {
         const items = [url.pathname, url.search]
         for (let item of items) {
             if (item.indexOf(`${cfg.UUID}`) >= 0) {
-                const config = create_config(url, cfg.UUID)
+                const log = new Logger(cfg.LOG_LEVEL)
+                const config = create_config(url, cfg.UUID, log)
                 return new Response(config, {
                     headers: {
                         'Content-Type': 'application/json',
@@ -897,7 +891,7 @@ async function fetch(request, env, ctx) {
             }
         }
     }
-    return new Response(`Hello world!`)
+    return new Response(`Hello world! [build=${BUILD_VER}]`)
 }
 
 export default {
