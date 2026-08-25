@@ -11,6 +11,117 @@ const BUFFER_SIZE = 64 * 1024 // read/write buffer size in bytes
 const UPLOAD_PACK_TARGET = 20 * 1024 // upload pack target size in bytes; small chunks are merged up to this size before a single writer.write
 const UPLOAD_PACK_FLUSH_MS = 1 // max latency (ms) to hold a partial buffer before forcing a flush
 
+// XHTTP obfs padding: HPACK Huffman code lengths (0x00-0xFF)
+const HPACK_HUFFMAN_CODE_LEN = [
+    13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
+    28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6,
+    5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10,
+    13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6,
+    15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5,
+    6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 15, 11, 14, 13, 28,
+    20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23,
+    24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 22, 23, 23, 24,
+    22, 21, 20, 22, 22, 23, 23, 21, 23, 22, 22, 24, 21, 22, 23, 23,
+    21, 21, 22, 21, 23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23,
+    26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 27, 26, 24, 25,
+    19, 21, 26, 27, 27, 26, 27, 24, 21, 21, 26, 26, 28, 27, 27, 27,
+    20, 24, 20, 21, 22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23,
+    26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26,
+    30
+]
+
+const XHTTP_BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+
+// Derive padding header name and query key from UUID
+function get_xhttp_padding_ident(uuid_str) {
+    // uuid_str: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' (36 chars)
+    // header: uuid[1:7] (6 chars), key: '_' + uuid[25:31] (6 chars)
+    return {
+        header: uuid_str.slice(1, 7),
+        key: '_' + uuid_str.slice(25, 31),
+    }
+}
+
+// Calculate HPACK Huffman encoded byte length of a string
+function calc_hpack_huffman_bytes(str) {
+    const bytes = new TextEncoder().encode(str)
+    let total_bits = 0
+    for (let i = 0; i < bytes.length; i++) {
+        total_bits += HPACK_HUFFMAN_CODE_LEN[bytes[i]]
+    }
+    return Math.ceil(total_bits / 8)
+}
+
+// Extract padding value from request (supports queryInHeader placement)
+function extract_xhttp_padding(request, header_name, key_name) {
+    const header_val = request.headers.get(header_name)
+    if (header_val) {
+        try {
+            // queryInHeader: header value is a URL, extract query param
+            const parsed = new URL(header_val, 'https://x.invalid')
+            const query_val = parsed.searchParams.get(key_name)
+            if (query_val) {
+                console.log(`[xhttp-obfs] extracted from header URL query: key='${key_name}', padding_len=${query_val.length}`)
+                return query_val
+            }
+        } catch (e) { }
+        console.log(`[xhttp-obfs] using direct header value: header='${header_name}', padding_len=${header_val.length}`)
+        return header_val // direct header value
+    }
+    // fallback: request URL query string
+    const url = new URL(request.url)
+    const query_padding = url.searchParams.get(key_name) || ''
+    if (query_padding) {
+        console.log(`[xhttp-obfs] extracted from URL query: key='${key_name}', padding_len=${query_padding.length}`)
+    }
+    return query_padding
+}
+
+// Validate padding: HPACK Huffman length in [98, 1002]
+function validate_xhttp_padding(request, header_name, key_name) {
+    const padding = extract_xhttp_padding(request, header_name, key_name)
+    if (!padding) {
+        console.log(`[xhttp-obfs] no padding present -> PASS (allow empty)`)
+        return true // no padding = pass
+    }
+    const huff_len = calc_hpack_huffman_bytes(padding)
+    const ok = huff_len >= 98 && huff_len <= 1002
+    console.log(`[xhttp-obfs] validation: huffman_len=${huff_len} bytes, range=[98,1002] -> ${ok ? 'PASS' : 'FAIL'}`)
+    if (!ok) {
+        console.log(`[xhttp-obfs] FAIL detail: padding_chars=${padding.length}, first_50='${padding.slice(0, 50)}...'`)n    }
+    return ok
+}
+
+// Generate random Base62 padding string
+function gen_xhttp_padding_str(len) {
+    let out = ''
+    for (let i = 0; i < len; i++) {
+        out += XHTTP_BASE62[Math.floor(Math.random() * 62)]
+    }
+    return out
+}
+
+// Build response headers with obfs padding (queryInHeader format)
+function build_xhttp_response_headers(uuid_str) {
+    const { header, key } = get_xhttp_padding_ident(uuid_str)
+    const padding = gen_xhttp_padding_str(100 + Math.floor(Math.random() * 901)) // 100-1000
+    const huff_len = calc_hpack_huffman_bytes(padding)
+    console.log(`[xhttp-obfs] response: header='${header}', key='${key}', padding_chars=${padding.length}, huffman=${huff_len} bytes`)
+    const url = new URL('https://x.invalid/')
+    url.searchParams.set(key, padding)
+    const headers = {
+        'X-Accel-Buffering': 'no',
+        'Cache-Control': 'no-store',
+        Connection: 'Keep-Alive',
+        'User-Agent': 'Go-http-client/2.0',
+        'Content-Type': 'application/grpc',
+    }
+    headers[header] = url.toString()
+    return headers
+}
+
 function to_size(size) {
     const KiB = 1024
     const min = 1.1 * KiB
@@ -624,7 +735,33 @@ async function handle_xhttp_client(log, body, cfg) {
 async function handle_post(request, cfg) {
     const log = new Logger(cfg.LOG_LEVEL)
     try {
-        return await handle_xhttp_client(log, request.body, cfg)
+        // XHTTP obfs padding validation
+        const { header, key } = get_xhttp_padding_ident(cfg.UUID)
+        log.debug(`xhttp-obfs: derived header='${header}', key='${key}'`)
+        
+        // Extract padding for detailed logging
+        const extracted = extract_xhttp_padding(request, header, key)
+        if (extracted) {
+            const huffLen = calc_hpack_huffman_bytes(extracted)
+            log.debug(`xhttp-obfs: extracted padding len=${extracted.length} chars, huffman=${huffLen} bytes`)
+        } else {
+            log.debug(`xhttp-obfs: no padding found in request`)
+        }
+        
+        if (!validate_xhttp_padding(request, header, key)) {
+            log.error(`xhttp-obfs: validation FAILED (header='${header}', key='${key}')`)
+            return null
+        }
+        log.debug(`xhttp-obfs: validation PASSED`)
+        
+        const result = await handle_xhttp_client(log, request.body, cfg)
+        if (result) {
+            // Attach response headers with obfs padding
+            result.response_headers = build_xhttp_response_headers(cfg.UUID)
+            const { header: rh, key: rk } = get_xhttp_padding_ident(cfg.UUID)
+            log.debug(`xhttp-obfs: response header '${rh}' set with queryInHeader padding`)
+        }
+        return result
     } catch (err) {
         log.error(`error: ${err}`)
     }
@@ -644,6 +781,17 @@ function create_config(url, uuid) {
     stream['xhttpSettings']['host'] = host
     stream['xhttpSettings']['path'] = path.endsWith('/') ? path : `${path}/`
     stream['tlsSettings']['serverName'] = host
+
+    // inject xPadding obfs config (extra)
+    console.log(`[xhttp-obfs] subscription: header='${header}', key='${key}' -> extra injected`)
+    const { header, key } = get_xhttp_padding_ident(uuid)
+    stream['xhttpSettings']['extra'] = {
+        xPaddingObfsMode: true,
+        xPaddingMethod: 'tokenish',
+        xPaddingPlacement: 'queryInHeader',
+        xPaddingHeader: header,
+        xPaddingKey: key
+    }
 
     return JSON.stringify(config)
 }
@@ -722,7 +870,7 @@ async function fetch(request, env, ctx) {
             // let Cloudflare's streaming response handle the long-lived
             // connection.
             return new Response(r.readable, {
-                headers: {
+                headers: r.response_headers || {
                     'X-Accel-Buffering': 'no',
                     'Cache-Control': 'no-store',
                     Connection: 'Keep-Alive',
